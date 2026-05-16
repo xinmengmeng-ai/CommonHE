@@ -1,0 +1,10 @@
+{
+  "build": {
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "resources": {
+      "resources/commonhe": "resources/commonhe"
+    }
+  }
+}

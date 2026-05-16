@@ -1,0 +1,134 @@
+[
+  {
+    "name": "superpowers",
+    "display_name": "superpowers",
+    "group": "core",
+    "verify_command": "using-superpowers + test-driven-development",
+    "install_commands": [
+      "按团队 superpowers 发布方式安装 using-superpowers 与 test-driven-development skills"
+    ],
+    "install_notes": [
+      "确认本机 skill 目录中同时存在 using-superpowers 和 test-driven-development。",
+      "支持本机用户级 agents skills 目录、Codex skills 目录与 Codex superpowers 目录等落点。"
+    ],
+    "remediation": [
+      "确认本机 skill 目录中同时存在 using-superpowers 和 test-driven-development。",
+      "如果缺失，请先安装对应 skills，再重新执行初始化。"
+    ],
+    "probes": [
+      {
+        "type": "skill_presence",
+        "skill_names": [
+          "using-superpowers",
+          "test-driven-development"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "agent-browser",
+    "display_name": "agent-browser",
+    "group": "browser",
+    "verify_command": "~/.agent-browser/config.json or ~/.roxybrowser/shortcuts.json",
+    "install_commands": [
+      "按 agent-browser 官方安装方式完成本机安装与首次配置"
+    ],
+    "install_notes": [
+      "确认 agent-browser 或 roxybrowser 已正确安装并完成本机配置。",
+      "如果本机使用 roxybrowser，至少应存在 ~/.roxybrowser/shortcuts.json。"
+    ],
+    "remediation": [
+      "确认 agent-browser 或 roxybrowser 已正确安装并完成本机配置。",
+      "如果本机使用 roxybrowser，至少应存在 ~/.roxybrowser/shortcuts.json。"
+    ],
+    "probes": [
+      {
+        "type": "file_exists",
+        "paths": [
+          "~/.agent-browser/config.json",
+          "~/.roxybrowser/shortcuts.json"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "chrome-devtools",
+    "display_name": "chrome-devtools",
+    "group": "browser",
+    "verify_command": "~/.codex/config.toml 包含 [mcp_servers.chrome-devtools] 与 chrome-devtools-mcp",
+    "install_commands": [
+      "codex mcp add chrome-devtools -- npx chrome-devtools-mcp@latest"
+    ],
+    "install_notes": [
+      "安装完成后，确认 ~/.codex/config.toml 中存在 [mcp_servers.chrome-devtools] 段落。",
+      "配置中应包含 chrome-devtools-mcp，才能视为 MCP 已接入。"
+    ],
+    "remediation": [
+      "请先把 chrome-devtools MCP 加入 Codex 配置，再重新执行初始化。"
+    ],
+    "probes": [
+      {
+        "type": "file_contains",
+        "paths": [
+          "~/.codex/config.toml"
+        ],
+        "patterns": [
+          "[mcp_servers.chrome-devtools]",
+          "chrome-devtools-mcp"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "GitNexus",
+    "display_name": "GitNexus",
+    "group": "analysis",
+    "verify_command": "gitnexus --version",
+    "install_commands": [
+      "npm install -g gitnexus"
+    ],
+    "install_notes": [
+      "优先验证 gitnexus CLI：gitnexus --version。",
+      "若当前环境只支持 npx，也可用 npx gitnexus --help 验证。"
+    ],
+    "remediation": [
+      "优先验证 gitnexus CLI：gitnexus --version。",
+      "如果未安装，请按 GitNexus 官方安装说明完成安装，并重新打开终端后重试。"
+    ],
+    "probes": [
+      {
+        "type": "command_success",
+        "commands": [
+          "gitnexus --version",
+          "npx gitnexus --help"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Speckit",
+    "display_name": "Speckit",
+    "group": "spec",
+    "verify_command": "specify --version",
+    "install_commands": [
+      "uv tool install specify-cli"
+    ],
+    "install_notes": [
+      "Spec Kit 官方 CLI 通常是 specify，不是 speckit。",
+      "安装完成后，优先用 specify --version 验证。"
+    ],
+    "remediation": [
+      "优先验证 Spec Kit CLI：specify --version。",
+      "Spec Kit 官方 CLI 通常是 specify，不是 speckit；如果缺失，请按 Spec Kit 官方安装说明安装后再重试。"
+    ],
+    "probes": [
+      {
+        "type": "command_success",
+        "commands": [
+          "specify --version",
+          "speckit --help"
+        ]
+      }
+    ]
+  }
+]

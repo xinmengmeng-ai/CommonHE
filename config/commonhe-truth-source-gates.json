@@ -1,0 +1,96 @@
+{
+  "version": "003",
+  "source_document": "docs/CommonHE开发目标.md",
+  "product_name": "星星的vibecoding启动器",
+  "target_clients": ["codex", "claude-code"],
+  "repo_rules": [
+    {
+      "id": "repo.product_name",
+      "severity": "blocking",
+      "description": "对外产品名必须统一为星星的vibecoding启动器。"
+    },
+    {
+      "id": "repo.provider_model_controlled",
+      "severity": "blocking",
+      "description": "provider/model 必须受控选择，默认不得自由输入模型名。"
+    },
+    {
+      "id": "repo.deepseek_builtin",
+      "severity": "blocking",
+      "description": "DeepSeek 必须是一等 provider，默认 deepseek-v4-flash，可选 deepseek-v4-pro，且要求 APIKey。"
+    },
+    {
+      "id": "repo.custom_validated",
+      "severity": "blocking",
+      "description": "custom 必须校验 URL、协议、模型、APIKey 与连通性。"
+    },
+    {
+      "id": "repo.main_agent_contract",
+      "severity": "blocking",
+      "description": "主 Agent 必须引用 product-manager.md 和 agency-agents-zh/README.md，输出三方案并走内置选择 UI。"
+    },
+    {
+      "id": "repo.resources_packaged",
+      "severity": "blocking",
+      "description": "桌面资源包必须包含 .specify、agency-agents-zh、truth-source gates。"
+    }
+  ],
+  "generated_rules": [
+    {
+      "id": "generated.codex_entry",
+      "severity": "blocking",
+      "description": "Codex 目标必须包含 AGENTS.md、.codex/、.agents/skills/，且不得包含 CLAUDE.md。"
+    },
+    {
+      "id": "generated.claude_entry",
+      "severity": "blocking",
+      "description": "Claude Code 目标必须包含 CLAUDE.md、.claude/，且不得包含 AGENTS.md。"
+    },
+    {
+      "id": "generated.commonhe_state",
+      "severity": "blocking",
+      "description": "初始化协作包必须包含 docs/、.commonhe/session/、.specify/；superpowers、agent-browser、chrome-devtools、GitNexus、Speckit 五项能力均为必需能力，不提供取消入口。"
+    },
+    {
+      "id": "generated.agency_agents",
+      "severity": "blocking",
+      "description": "agent 文件必须来自 agency-agents-zh 真实 agent 库映射，不得使用 frontend.md/backend.md/qa.md 等占位文件。"
+    },
+    {
+      "id": "generated.no_business_scaffold_claim",
+      "severity": "blocking",
+      "description": "生成文档不得暗示业务项目成品、业务代码或业务脚手架已经生成。"
+    },
+    {
+      "id": "generated.no_template_residue",
+      "severity": "blocking",
+      "description": "生成文档不得残留占位符或泛化模板填充值。"
+    }
+  ],
+  "forbidden_generated_phrases": [
+    "{{",
+    "}}",
+    "ExampleProject",
+    "Build the first usable version quickly",
+    "当前无自动分析假设",
+    "当前无自动分析信号",
+    "生成项目骨架",
+    "当前目录已经生成 HE 协作工程",
+    "业务项目成品已生成",
+    "业务脚手架已生成",
+    "业务代码已生成",
+    "CommonHE Init Orchestrator",
+    "CommonHE 正式流程",
+    "核心实现已完成",
+    "review 已完成",
+    "qa 已完成"
+  ],
+  "placeholder_agent_files": [
+    "frontend.md",
+    "backend.md",
+    "qa.md",
+    "docs.md",
+    "reviewer.md",
+    "architect.md"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "commonhe": {
+    "targetClient": "claude-code",
+    "packageType": "initialization-collaboration-package",
+    "projectName": "{{project_name}}",
+    "truthSources": [
+      "CLAUDE.md",
+      "docs/project_context.md",
+      "docs/architecture/01-项目架构设计书.md",
+      "docs/roadmap/01-实施路线图.md"
+    ]
+  }
+}

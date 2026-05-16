@@ -1,0 +1,12 @@
+{
+  "user_confirmed": true,
+  "project_name": "ExampleProject",
+  "project_type": "portal-site",
+  "solution_mode": "fast-mvp",
+  "enabled_roles": [
+    "frontend",
+    "reviewer",
+    "docs"
+  ],
+  "integrations": []
+}

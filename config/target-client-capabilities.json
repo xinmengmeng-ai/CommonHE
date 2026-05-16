@@ -1,0 +1,52 @@
+[
+  {
+    "id": "superpowers",
+    "display_name": "superpowers / required skills",
+    "recommended": true,
+    "required": true,
+    "locked": true,
+    "clients": ["codex", "claude-code"],
+    "install_commands": ["使用包内预装或团队发布方式安装 using-superpowers 与 test-driven-development"],
+    "verify_commands": ["skill_presence: using-superpowers, test-driven-development"]
+  },
+  {
+    "id": "chrome-devtools",
+    "display_name": "chrome-devtools MCP",
+    "recommended": true,
+    "required": true,
+    "locked": true,
+    "clients": ["codex", "claude-code"],
+    "install_commands": ["codex mcp add chrome-devtools -- npx chrome-devtools-mcp@latest"],
+    "verify_commands": ["~/.codex/config.toml or .mcp.json contains chrome-devtools"]
+  },
+  {
+    "id": "GitNexus",
+    "display_name": "GitNexus",
+    "recommended": true,
+    "required": true,
+    "locked": true,
+    "clients": ["codex", "claude-code"],
+    "install_commands": ["npm install -g gitnexus"],
+    "verify_commands": ["gitnexus --version"]
+  },
+  {
+    "id": "Speckit",
+    "display_name": "Speckit",
+    "recommended": true,
+    "required": true,
+    "locked": true,
+    "clients": ["codex", "claude-code"],
+    "install_commands": ["uv tool install specify-cli"],
+    "verify_commands": ["specify --version"]
+  },
+  {
+    "id": "agent-browser",
+    "display_name": "agent-browser",
+    "recommended": true,
+    "required": true,
+    "locked": true,
+    "clients": ["codex", "claude-code"],
+    "install_commands": ["使用包内说明或官方仓库安装 agent-browser"],
+    "verify_commands": ["~/.agent-browser/config.json or ~/.roxybrowser/shortcuts.json"]
+  }
+]
