@@ -313,9 +313,23 @@ export function formatRecoverableRuntimeErrorForUser(
     return "当前不支持官方 Codex 登录授权。本轮请求已经结束；请返回渠道设置，改用 Codex 的 OpenAI Responses API 配置并提供 APIKey。";
   }
   if (message.includes("agent_response_invalid") || message.includes("semantic_agent_response_invalid")) {
-    return "模型返回内容格式不符合要求，本轮请求已经结束。你可以直接重试；如果连续出现，请切换模型或渠道。";
+    const diagnostic = summarizeRecoverableDiagnostic(message);
+    return diagnostic
+      ? `模型返回内容格式不符合要求，本轮请求已经结束。你可以直接重试；如果连续出现，请切换模型或渠道。诊断：${diagnostic}`
+      : "模型返回内容格式不符合要求，本轮请求已经结束。你可以直接重试；如果连续出现，请切换模型或渠道。";
   }
   return `${message}。本轮请求已结束，窗口已恢复；请按提示处理后重试。`;
+}
+
+function summarizeRecoverableDiagnostic(message: string): string {
+  const sanitized = sanitizeDiagnosticDetail(message)
+    .replace(/^agent_response_invalid\s*/i, "")
+    .replace(/^semantic_agent_response_invalid\s*/i, "")
+    .trim();
+  if (!sanitized) {
+    return "";
+  }
+  return sanitized.length > 280 ? `${sanitized.slice(0, 280)}...` : sanitized;
 }
 
 export function formatDiagnosticLog(payload: DiagnosticLogPayload): string {

@@ -6,12 +6,12 @@ CommonHE is the public engineering package for `Xingxing's vibecoding launcher`.
 
 It helps users select a model provider, choose a target workspace, clarify requirements, compare implementation options, confirm a solution, and write the collaboration files Codex needs to continue the project.
 
-## v1.0 Release Package
+## v1.0.1 Release Package
 
-The v1.0 launcher package is included in this repository:
+The v1.0.1 launcher package is included in this repository:
 
 ```text
-release/CommonHE-v1.0.zip
+release/CommonHE-v1.0.1.zip
 ```
 
 The package contains:
@@ -32,9 +32,9 @@ The package contains:
 
 ## Scope
 
-CommonHE v1.0 focuses on generating Codex handoff collaboration packages. It does not generate business application source code, automatically install dependencies for the target project, or directly implement the user's business system.
+CommonHE v1.0.1 focuses on generating Codex handoff collaboration packages. It does not generate business application source code, automatically install dependencies for the target project, or directly implement the user's business system.
 
-Claude Code and Gemini CLI target packages are outside the v1.0 release scope.
+Claude Code and Gemini CLI target packages are outside the v1.0.1 release scope.
 
 ## Requirements
 
@@ -104,7 +104,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\desktop-smoke.tests.ps
 After generating the launcher zip, run release-package verification:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\release-package.tests.ps1 -ReleaseZipPath release\CommonHE-v1.0.zip -ReleaseName CommonHE-v1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\release-package.tests.ps1 -ReleaseZipPath release\CommonHE-v1.0.1.zip -ReleaseName CommonHE-v1.0.1
 ```
 
 ## Project Structure

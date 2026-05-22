@@ -226,6 +226,14 @@ assert.equal(
   "当前不支持官方 Codex 登录授权。本轮请求已经结束；请返回渠道设置，改用 Codex 的 OpenAI Responses API 配置并提供 APIKey。",
 );
 
+const invalidResponseMessage = formatRecoverableRuntimeErrorForUser(
+  "agent_response_invalid status=200 endpoint=https://api.deepseek.com/v1/chat/completions invalid_json reason=empty_body bodySnippet=api_key=sk-live-secret123456",
+);
+assert.match(invalidResponseMessage, /模型返回内容格式不符合要求/);
+assert.match(invalidResponseMessage, /status=200/);
+assert.match(invalidResponseMessage, /reason=empty_body/);
+assert.doesNotMatch(invalidResponseMessage, /sk-live-secret123456/);
+
 const recoverableErrorState = reducer(runStarted, {
   type: "initialize.recoverableError",
   payload: "梦星星这轮回复没有生成成功",

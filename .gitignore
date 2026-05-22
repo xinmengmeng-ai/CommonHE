@@ -42,6 +42,13 @@ build/Release
 node_modules/
 jspm_packages/
 
+# Local verification/build artifacts
+tmp/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/resources/commonhe/
+release/
+
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
 

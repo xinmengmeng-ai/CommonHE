@@ -6,12 +6,12 @@ CommonHE 是 `星星的vibecoding启动器` 的公开工程包。它不是普通
 
 它会帮助用户完成模型渠道选择、目标工作区选择、需求澄清、方案对比、方案确认，并把后续交给 Codex 接手所需的协作文件落地到目标项目中。
 
-## v1.0 发布包
+## v1.0.1 发布包
 
-v1.0 启动器包已放在仓库内：
+v1.0.1 启动器包已放在仓库内：
 
 ```text
-release/CommonHE-v1.0.zip
+release/CommonHE-v1.0.1.zip
 ```
 
 包内包含：
@@ -32,9 +32,9 @@ release/CommonHE-v1.0.zip
 
 ## 范围说明
 
-CommonHE v1.0 聚焦生成 Codex 接手协作包。它不会生成业务应用源码、不会自动安装目标项目依赖，也不会替用户直接实现目标业务系统。
+CommonHE v1.0.1 聚焦生成 Codex 接手协作包。它不会生成业务应用源码、不会自动安装目标项目依赖，也不会替用户直接实现目标业务系统。
 
-Claude Code 和 Gemini CLI 目标包不属于 v1.0 发布范围。
+Claude Code 和 Gemini CLI 目标包不属于 v1.0.1 发布范围。
 
 ## 环境要求
 
@@ -104,7 +104,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\desktop-smoke.tests.ps
 生成启动器 zip 后运行发布包验证：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tests\release-package.tests.ps1 -ReleaseZipPath release\CommonHE-v1.0.zip -ReleaseName CommonHE-v1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\release-package.tests.ps1 -ReleaseZipPath release\CommonHE-v1.0.1.zip -ReleaseName CommonHE-v1.0.1
 ```
 
 ## 项目结构

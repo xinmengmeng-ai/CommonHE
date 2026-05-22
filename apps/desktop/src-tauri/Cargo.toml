@@ -1,7 +1,7 @@
 [package]
 name = "commonhe-desktop"
-version = "1.0.0"
-description = "星星的vibecoding启动器 v1.0"
+version = "1.0.1"
+description = "星星的vibecoding启动器 v1.0.1"
 authors = ["星星的vibecoding启动器"]
 license = "MIT"
 edition = "2021"

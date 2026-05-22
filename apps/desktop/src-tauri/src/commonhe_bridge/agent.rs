@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Mutex as TestMutex;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -342,6 +343,7 @@ pub struct AgentChooseRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AgentSession {
+    session_id: String,
     provider: String,
     model: String,
     api_key: String,
@@ -405,6 +407,7 @@ impl AgentStore {
             normalize_session_wire_api(&request.wire_api, &request.provider, &request.base_url);
         let resolved_api_key = resolve_session_api_key(&request.provider, &request.api_key)?;
         let mut session = AgentSession {
+            session_id: session_id.clone(),
             provider: request.provider,
             model: request.model,
             api_key: resolved_api_key,
@@ -429,7 +432,13 @@ impl AgentStore {
             finished: false,
         };
 
-        let decision = request_agent_decision_with_contract_repair(&session, None)?;
+        let decision = match request_agent_decision_with_contract_repair(&session, None) {
+            Ok(decision) => decision,
+            Err(error) => {
+                append_agent_runtime_diagnostic(&session, &session_id, "session", &error);
+                return Err(error);
+            }
+        };
         apply_agent_decision(&mut session, decision)?;
 
         let snapshot = snapshot_from_session(&session_id, &session);
@@ -463,6 +472,12 @@ impl AgentStore {
             match request_agent_decision_with_contract_repair(session, Some("user_message")) {
                 Ok(decision) => decision,
                 Err(error) => {
+                    append_agent_runtime_diagnostic(
+                        session,
+                        &request.session_id,
+                        "message",
+                        &error,
+                    );
                     session.messages.truncate(original_message_len);
                     return Err(error);
                 }
@@ -784,12 +799,316 @@ fn snapshot_from_session(session_id: &str, session: &AgentSession) -> AgentSessi
     }
 }
 
+fn append_agent_runtime_diagnostic(
+    session: &AgentSession,
+    session_id: &str,
+    operation: &str,
+    detail: &str,
+) {
+    let workspace_path = session.workspace_path.trim();
+    if workspace_path.is_empty() {
+        return;
+    }
+
+    let diagnostic_dir = PathBuf::from(workspace_path)
+        .join(".commonhe")
+        .join("session")
+        .join(safe_session_path_segment(session_id));
+    if fs::create_dir_all(&diagnostic_dir).is_err() {
+        return;
+    }
+
+    let payload = json!({
+        "schemaVersion": 1,
+        "timestampUnixMs": current_unix_millis(),
+        "operation": operation,
+        "provider": session.provider,
+        "model": session.model,
+        "baseUrl": session.base_url,
+        "wireApi": effective_session_wire_api(session),
+        "messageCount": session.messages.len(),
+        "readiness": {
+            "productType": session.readiness.product_type,
+            "targetUsers": session.readiness.target_users,
+            "coreProblem": session.readiness.core_problem,
+            "keyFeaturesCount": session.readiness.key_features.len(),
+            "constraintsCount": session.readiness.constraints.len(),
+            "summaryPresented": session.readiness.summary_presented,
+            "summaryConfirmed": session.readiness.summary_confirmed,
+            "missingFields": session.readiness.missing_fields,
+            "readyForSolutions": session.readiness.ready_for_solutions,
+        },
+        "error": sanitize_agent_error_detail(detail),
+    });
+
+    let Ok(line) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let diagnostic_path = diagnostic_dir.join("runtime-diagnostics.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(diagnostic_path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+fn safe_session_path_segment(session_id: &str) -> String {
+    let safe = session_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "unknown-session".to_string()
+    } else {
+        safe
+    }
+}
+
+fn current_unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[derive(Clone)]
+struct AgentCallLogContext {
+    session_id: String,
+    workspace_path: String,
+    operation: String,
+    provider: String,
+    model: String,
+    base_url: String,
+    wire_api: String,
+    trigger: Option<String>,
+    attempt: String,
+}
+
+fn agent_operation_from_trigger(trigger: Option<&str>) -> &'static str {
+    match trigger {
+        None | Some("session_start") => "session",
+        _ => "message",
+    }
+}
+
+fn post_agent_decision_json(
+    client: &Client,
+    session: &AgentSession,
+    trigger: Option<&str>,
+    attempt: &str,
+    endpoint: &str,
+    request_body: &Value,
+) -> Result<Value, AgentHttpError> {
+    post_session_agent_json(
+        client,
+        session,
+        agent_operation_from_trigger(trigger),
+        trigger,
+        attempt,
+        endpoint,
+        request_body,
+    )
+}
+
+fn post_session_agent_json(
+    client: &Client,
+    session: &AgentSession,
+    operation: &str,
+    trigger: Option<&str>,
+    attempt: &str,
+    endpoint: &str,
+    request_body: &Value,
+) -> Result<Value, AgentHttpError> {
+    let context = AgentCallLogContext {
+        session_id: session.session_id.clone(),
+        workspace_path: session.workspace_path.clone(),
+        operation: operation.to_string(),
+        provider: session.provider.clone(),
+        model: session.model.clone(),
+        base_url: session.base_url.clone(),
+        wire_api: effective_session_wire_api(session),
+        trigger: trigger.map(str::to_string),
+        attempt: attempt.to_string(),
+    };
+    post_agent_json(
+        client,
+        endpoint,
+        &session.api_key,
+        request_body,
+        Some(&context),
+    )
+}
+
+fn append_agent_call_log(
+    context: Option<&AgentCallLogContext>,
+    endpoint: &str,
+    request_body: &Value,
+    status_code: Option<u16>,
+    content_type: Option<&str>,
+    response_body: Option<&str>,
+    parsed_response: Option<&Value>,
+    parse_error: Option<&str>,
+    transport_error: Option<&str>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let Some(log_dir) = commonhe_runtime_log_dir() else {
+        return;
+    };
+    if fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+
+    let response_structure = parsed_response
+        .map(summarize_json_value_structure)
+        .unwrap_or_else(|| {
+            json!({
+                "type": "unparsed",
+                "textCandidateCount": 0,
+            })
+        });
+    let payload = json!({
+        "schemaVersion": 1,
+        "timestampUnixMs": current_unix_millis(),
+        "sessionId": safe_session_path_segment(&context.session_id),
+        "workspacePath": context.workspace_path,
+        "operation": context.operation,
+        "provider": context.provider,
+        "model": context.model,
+        "baseUrl": context.base_url,
+        "wireApi": context.wire_api,
+        "trigger": context.trigger,
+        "attempt": context.attempt,
+        "endpoint": endpoint,
+        "requestBody": redact_json_for_agent_log(request_body),
+        "responseStatus": status_code,
+        "responseContentType": content_type,
+        "responseStructure": response_structure,
+        "responseBodySnippet": response_body.map(|body| sanitize_agent_log_text(body, 4000)),
+        "parseError": parse_error,
+        "transportError": transport_error.map(|error| sanitize_agent_log_text(error, 1000)),
+    });
+
+    let Ok(line) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let log_path = log_dir.join("commonhe-agent-calls.jsonl");
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+fn commonhe_runtime_log_dir() -> Option<PathBuf> {
+    if let Some(root) = commonhe_runtime_root_from_env() {
+        return Some(root.join("data").join("logs"));
+    }
+
+    #[cfg(test)]
+    {
+        return Some(commonhe_test_runtime_root().join("data").join("logs"));
+    }
+
+    #[cfg(not(test))]
+    {
+        let exe_path = std::env::current_exe().ok()?;
+        let runtime_root = exe_path.parent()?.to_path_buf();
+        Some(runtime_root.join("data").join("logs"))
+    }
+}
+
+fn commonhe_runtime_root_from_env() -> Option<PathBuf> {
+    let root = std::env::var_os("COMMONHE_RUNTIME_ROOT")?;
+    let root = PathBuf::from(root);
+    if root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(root)
+    }
+}
+
+#[cfg(test)]
+fn commonhe_test_runtime_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("repo root should exist")
+        .join("tmp")
+        .join("desktop-main-flow")
+        .join(format!("commonhe-runtime-log-root-{}", std::process::id()))
+}
+
+fn summarize_json_value_structure(value: &Value) -> Value {
+    let mut candidates = Vec::new();
+    collect_text_candidates(value, &mut candidates);
+    json!({
+        "type": value_type_name(value),
+        "topLevelKeys": value.as_object()
+            .map(|map| map.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "choiceCount": value.get("choices").and_then(Value::as_array).map(Vec::len),
+        "outputCount": value.get("output").and_then(Value::as_array).map(Vec::len),
+        "textCandidateCount": candidates.len(),
+        "firstTextPreview": candidates
+            .iter()
+            .find(|text| !text.trim().is_empty())
+            .map(|text| sanitize_agent_log_text(text, 1000)),
+    })
+}
+
+fn redact_json_for_agent_log(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(sanitize_agent_log_text(text, 8000)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json_for_agent_log).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    if key.eq_ignore_ascii_case("api_key")
+                        || key.eq_ignore_ascii_case("apiKey")
+                        || key.eq_ignore_ascii_case("authorization")
+                    {
+                        (key.clone(), Value::String("[redacted]".to_string()))
+                    } else {
+                        (key.clone(), redact_json_for_agent_log(value))
+                    }
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn sanitize_agent_log_text(detail: &str, max_chars: usize) -> String {
+    let redacted = detail
+        .replace("Bearer ", "Bearer [redacted] ")
+        .replace("api_key", "api_key[redacted]");
+    redact_inline_api_key_tokens(&redacted)
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 fn apply_agent_decision(session: &mut AgentSession, decision: AgentDecision) -> Result<(), String> {
     let readiness = merge_readiness(
         &session.readiness,
         decision.readiness,
         &session.messages,
         decision.understanding_summary.as_deref(),
+        &session.provider,
     );
     let solutions_allowed = readiness.ready_for_solutions
         && readiness.summary_confirmed
@@ -866,7 +1185,7 @@ fn request_agent_decision(
 
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
+        .timeout(agent_request_timeout(session))
         .build()
         .map_err(|_| "agent_client_build_failed".to_string())?;
 
@@ -881,12 +1200,33 @@ fn request_agent_decision(
 
     if wire_api == "responses" {
         let primary_request = build_responses_request_body(session, trigger);
-        match post_agent_json(&client, &endpoint, &session.api_key, &primary_request) {
-            Ok(value) => return parse_agent_decision_response(&value),
+        match post_agent_decision_json(
+            &client,
+            session,
+            trigger,
+            "agent.responses.primary",
+            &endpoint,
+            &primary_request,
+        ) {
+            Ok(value) => {
+                return parse_agent_decision_response_for_provider(&value, &session.provider)
+            }
             Err(error) if error.status_code == 400 => {
                 let compat_request = build_responses_compat_request_body(session, trigger);
-                match post_agent_json(&client, &endpoint, &session.api_key, &compat_request) {
-                    Ok(value) => return parse_agent_decision_response(&value),
+                match post_agent_decision_json(
+                    &client,
+                    session,
+                    trigger,
+                    "agent.responses.compat",
+                    &endpoint,
+                    &compat_request,
+                ) {
+                    Ok(value) => {
+                        return parse_agent_decision_response_for_provider(
+                            &value,
+                            &session.provider,
+                        )
+                    }
                     Err(fallback_error) => return Err(map_agent_http_error(&fallback_error)),
                 }
             }
@@ -897,24 +1237,65 @@ fn request_agent_decision(
     let request_body = build_chat_completions_request_body(session, trigger);
     let compat_request_body = build_chat_completions_compat_request_body(session, trigger);
     let minimal_request_body = build_chat_completions_minimal_request_body(session, trigger);
-    let value = match post_agent_json(&client, &endpoint, &session.api_key, &request_body) {
+    let value = match post_agent_decision_json(
+        &client,
+        session,
+        trigger,
+        "agent.chat.primary",
+        &endpoint,
+        &request_body,
+    ) {
         Ok(value) => value,
         Err(error) if error.status_code == 400 => {
-            match post_agent_json(&client, &endpoint, &session.api_key, &compat_request_body) {
+            match post_agent_decision_json(
+                &client,
+                session,
+                trigger,
+                "agent.chat.compat",
+                &endpoint,
+                &compat_request_body,
+            ) {
                 Ok(value) => value,
-                Err(compat_error) if compat_error.status_code == 400 => {
-                    post_agent_json(&client, &endpoint, &session.api_key, &minimal_request_body)
-                        .map_err(|minimal_error| map_agent_http_error(&minimal_error))?
+                Err(compat_error)
+                    if compat_error.status_code == 400
+                        || should_retry_chat_request_with_compat_body(session, &compat_error) =>
+                {
+                    post_agent_decision_json(
+                        &client,
+                        session,
+                        trigger,
+                        "agent.chat.minimal",
+                        &endpoint,
+                        &minimal_request_body,
+                    )
+                    .map_err(|minimal_error| map_agent_http_error(&minimal_error))?
                 }
                 Err(compat_error) => return Err(map_agent_http_error(&compat_error)),
             }
         }
         Err(error) if should_retry_chat_request_with_compat_body(session, &error) => {
-            match post_agent_json(&client, &endpoint, &session.api_key, &compat_request_body) {
+            match post_agent_decision_json(
+                &client,
+                session,
+                trigger,
+                "agent.chat.compat",
+                &endpoint,
+                &compat_request_body,
+            ) {
                 Ok(value) => value,
-                Err(compat_error) if compat_error.status_code == 400 => {
-                    post_agent_json(&client, &endpoint, &session.api_key, &minimal_request_body)
-                        .map_err(|minimal_error| map_agent_http_error(&minimal_error))?
+                Err(compat_error)
+                    if compat_error.status_code == 400
+                        || should_retry_chat_request_with_compat_body(session, &compat_error) =>
+                {
+                    post_agent_decision_json(
+                        &client,
+                        session,
+                        trigger,
+                        "agent.chat.minimal",
+                        &endpoint,
+                        &minimal_request_body,
+                    )
+                    .map_err(|minimal_error| map_agent_http_error(&minimal_error))?
                 }
                 Err(compat_error) => return Err(map_agent_http_error(&compat_error)),
             }
@@ -925,31 +1306,49 @@ fn request_agent_decision(
         Err(error) => return Err(map_agent_http_error(&error)),
     };
 
-    match parse_agent_decision_response(&value) {
+    match parse_agent_decision_response_for_provider(&value, &session.provider) {
         Ok(decision) => Ok(decision),
         Err(error) if should_retry_agent_parse_with_chat_fallback(&error) => {
-            let compat_value =
-                match post_agent_json(&client, &endpoint, &session.api_key, &compat_request_body) {
-                    Ok(value) => value,
-                    Err(compat_error) if compat_error.status_code == 400 => {
-                        post_agent_json(&client, &endpoint, &session.api_key, &minimal_request_body)
-                            .map_err(|minimal_error| map_agent_http_error(&minimal_error))?
-                    }
-                    Err(compat_error) => return Err(map_agent_http_error(&compat_error)),
-                };
-            match parse_agent_decision_response(&compat_value) {
+            let compat_value = match post_agent_decision_json(
+                &client,
+                session,
+                trigger,
+                "agent.chat.compat",
+                &endpoint,
+                &compat_request_body,
+            ) {
+                Ok(value) => value,
+                Err(compat_error)
+                    if compat_error.status_code == 400
+                        || should_retry_chat_request_with_compat_body(session, &compat_error) =>
+                {
+                    post_agent_decision_json(
+                        &client,
+                        session,
+                        trigger,
+                        "agent.chat.minimal",
+                        &endpoint,
+                        &minimal_request_body,
+                    )
+                    .map_err(|minimal_error| map_agent_http_error(&minimal_error))?
+                }
+                Err(compat_error) => return Err(map_agent_http_error(&compat_error)),
+            };
+            match parse_agent_decision_response_for_provider(&compat_value, &session.provider) {
                 Ok(decision) => Ok(decision),
                 Err(compat_parse_error)
                     if should_retry_agent_parse_with_chat_fallback(&compat_parse_error) =>
                 {
-                    let minimal_value = post_agent_json(
+                    let minimal_value = post_agent_decision_json(
                         &client,
+                        session,
+                        trigger,
+                        "agent.chat.minimal",
                         &endpoint,
-                        &session.api_key,
                         &minimal_request_body,
                     )
                     .map_err(|minimal_error| map_agent_http_error(&minimal_error))?;
-                    parse_agent_decision_response(&minimal_value)
+                    parse_agent_decision_response_for_provider(&minimal_value, &session.provider)
                 }
                 Err(compat_parse_error) => Err(compat_parse_error),
             }
@@ -966,12 +1365,26 @@ fn request_agent_decision_via_responses(
 ) -> Result<Value, String> {
     let endpoint = format!("{}/responses", session.base_url.trim_end_matches('/'));
     let primary_request = build_responses_request_body(session, trigger);
-    match post_agent_json(client, &endpoint, &session.api_key, &primary_request) {
+    match post_agent_decision_json(
+        client,
+        session,
+        trigger,
+        "agent.responses.retry.primary",
+        &endpoint,
+        &primary_request,
+    ) {
         Ok(value) => Ok(value),
         Err(error) if error.status_code == 400 => {
             let compat_request = build_responses_compat_request_body(session, trigger);
-            post_agent_json(client, &endpoint, &session.api_key, &compat_request)
-                .map_err(|fallback_error| map_agent_http_error(&fallback_error))
+            post_agent_decision_json(
+                client,
+                session,
+                trigger,
+                "agent.responses.retry.compat",
+                &endpoint,
+                &compat_request,
+            )
+            .map_err(|fallback_error| map_agent_http_error(&fallback_error))
         }
         Err(error) => Err(map_agent_http_error(&error)),
     }
@@ -989,20 +1402,73 @@ fn should_retry_chat_request_with_compat_body(
 ) -> bool {
     session.provider.trim().eq_ignore_ascii_case("deepseek")
         && error.status_code == 200
-        && error.body.starts_with("invalid_json")
-        && error.body.contains("reason=empty_body")
+        && ((error.body.starts_with("invalid_json") && error.body.contains("reason=empty_body"))
+            || error.body.starts_with("response_body_read_failed"))
 }
+
+const MAX_AGENT_CONTRACT_REPAIR_ROUNDS: usize = 2;
 
 fn request_agent_decision_with_contract_repair(
     session: &AgentSession,
     trigger: Option<&str>,
 ) -> Result<AgentDecision, String> {
-    match request_agent_decision(session, trigger) {
-        Ok(decision) => Ok(decision),
-        Err(error) if is_repairable_agent_contract_error(&error) => {
-            request_agent_decision(session, Some(contract_repair_trigger(&error)))
+    let mut repair_rounds = 0usize;
+    let mut next_trigger = trigger;
+
+    loop {
+        match request_agent_decision(session, next_trigger) {
+            Ok(decision) if should_retry_confirmed_question_as_solutions(session, &decision) => {
+                if repair_rounds < MAX_AGENT_CONTRACT_REPAIR_ROUNDS {
+                    repair_rounds += 1;
+                    next_trigger = Some("contract_repair_confirmed_solutions");
+                    continue;
+                }
+
+                return Ok(decision);
+            }
+            Ok(decision) => return Ok(decision),
+            Err(error)
+                if is_repairable_agent_contract_error(&error)
+                    && repair_rounds < MAX_AGENT_CONTRACT_REPAIR_ROUNDS =>
+            {
+                repair_rounds += 1;
+                next_trigger = Some(contract_repair_trigger(&error));
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
+    }
+}
+
+fn should_retry_confirmed_question_as_solutions(
+    session: &AgentSession,
+    decision: &AgentDecision,
+) -> bool {
+    if decision.mode != "question" {
+        return false;
+    }
+
+    let Some(latest_user) = latest_user_message(&session.messages) else {
+        return false;
+    };
+
+    is_explicit_confirmation_message_for_provider(&session.provider, latest_user)
+        && readiness_has_required_details(&session.readiness)
+        && session.readiness.summary_presented
+        && session
+            .readiness
+            .missing_fields
+            .iter()
+            .all(|field| field == "用户确认")
+}
+
+fn agent_request_timeout(session: &AgentSession) -> Duration {
+    if provider_allows_minimax_reasoning_cleanup(&session.provider)
+        || (session.provider.trim().eq_ignore_ascii_case("deepseek")
+            && session.model.trim().eq_ignore_ascii_case("deepseek-v4-pro"))
+    {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(60)
     }
 }
 
@@ -1010,19 +1476,55 @@ fn build_agent_instruction() -> &'static str {
     "Collect enough information to understand product type, target users, core problem, key features, and constraints. Do not return solutions until those fields are complete and the user has explicitly confirmed your summary is accurate. When information is missing, return mode=question and ask exactly one concise follow-up question. When all required information is complete and the user has confirmed your summary, return mode=solutions with exactly three solutions. Solutions are implementation plans for the later handoff, not claims that business code or a finished MVP has already been generated. tokenEstimate must describe LLM planning/review/handoff budget, not completed business code. omittedRoleRationale must only include roles that are not in teamComposition. If a target client such as Codex or Claude Code is later selected, treat it only as the collaboration-package handoff entry, not as the business runtime, hosting platform, deployment platform, or architecture requirement."
 }
 
+fn agent_json_contract_instruction() -> &'static str {
+    "Return exactly one complete, valid JSON object and nothing else. Hard requirements: Output must be raw JSON only. Do not include Markdown, bullet lists, XML/HTML tags, YAML, code fences, commentary, explanatory prose, or any text before or after the JSON object. Do not include pseudo tool calls or agent tags such as <solution-picker-agent>. Ensure the JSON is syntactically valid and fully parseable by a desktop program. Include mode with the exact string value \"question\" or \"solutions\". Include readiness as a JSON object when reporting discovery state. If mode is \"solutions\", include solutions as a JSON array at the top level; do not omit mode or solutions[]. Minimum acceptance criteria: The response parses as JSON without errors. The top-level object contains \"mode\". If and only if mode is \"solutions\", the top-level object contains \"mode\": \"solutions\" and \"solutions\": [] or a populated solutions array. The desktop program opens the solution selector only after it successfully parses mode=\"solutions\" and solutions[]."
+}
+
 fn build_agent_context_prompt(session: &AgentSession, trigger: Option<&str>) -> String {
     format!(
-        "Current provider: {}. Current workspace: {}. Trigger: {}. Important product semantics: target clients such as Codex and Claude Code only select the generated collaboration package entry files; they are not business runtime, deployment, hosting, or architecture platforms. {} {} Respond with JSON only. JSON shape: {{\"mode\":\"question|solutions\",\"assistantMessage\":\"...\",\"understandingSummary\":\"...\",\"readiness\":{{\"productType\":\"...\",\"targetUsers\":\"...\",\"coreProblem\":\"...\",\"keyFeatures\":[\"...\"],\"constraints\":[\"...\"],\"summaryPresented\":true,\"summaryConfirmed\":false,\"missingFields\":[\"...\"],\"readyForSolutions\":false}},\"solutions\":[{{\"id\":\"A\",\"title\":\"...\",\"architectureSummary\":\"...\",\"teamComposition\":[\"...\"],\"tokenEstimate\":\"...\",\"recommendationText\":\"...\",\"roleRationale\":{{\"frontend\":\"why this role is needed\"}},\"omittedRoleRationale\":{{\"qa\":\"why this plausible role is not selected yet\"}}}}]}}",
+        "Current provider: {}. Current workspace: {}. Trigger: {}. Important product semantics: target clients such as Codex and Claude Code only select the generated collaboration package entry files; they are not business runtime, deployment, hosting, or architecture platforms. {} {} {} {} Respond with JSON only. JSON shape: {{\"mode\":\"question|solutions\",\"assistantMessage\":\"...\",\"understandingSummary\":\"...\",\"readiness\":{{\"productType\":\"...\",\"targetUsers\":\"...\",\"coreProblem\":\"...\",\"keyFeatures\":[\"...\"],\"constraints\":[\"...\"],\"summaryPresented\":true,\"summaryConfirmed\":false,\"missingFields\":[\"...\"],\"readyForSolutions\":false}},\"solutions\":[{{\"id\":\"A\",\"title\":\"...\",\"architectureSummary\":\"...\",\"teamComposition\":[\"...\"],\"tokenEstimate\":\"...\",\"recommendationText\":\"...\",\"roleRationale\":{{\"frontend\":\"why this role is needed\"}},\"omittedRoleRationale\":{{\"qa\":\"why this plausible role is not selected yet\"}}}}]}}",
         session.provider,
         session.workspace_path,
         trigger.unwrap_or("session_start"),
         build_agent_instruction(),
-        agent_contract_repair_instruction(trigger)
+        agent_json_contract_instruction(),
+        agent_contract_repair_instruction(trigger),
+        custom_provider_agent_context(session)
+    )
+}
+
+fn custom_provider_agent_context(session: &AgentSession) -> String {
+    if !provider_allows_minimax_reasoning_cleanup(&session.provider) {
+        return String::new();
+    }
+
+    let latest_user = latest_user_message(&session.messages).unwrap_or_default();
+    let latest_user_confirmed =
+        is_explicit_confirmation_message_for_provider(&session.provider, latest_user);
+    let readiness = &session.readiness;
+    let missing = if readiness.missing_fields.is_empty() {
+        "none".to_string()
+    } else {
+        readiness.missing_fields.join(",")
+    };
+
+    format!(
+        "Custom provider state: currentReadiness={{productType:{},targetUsers:{},coreProblem:{},keyFeatures:{},constraints:{},summaryPresented:{},summaryConfirmed:{},missingFields:{}}}; latestUserConfirmed={}. If latestUserConfirmed=true and all required detail fields are present, output mode=solutions with exactly three alternatives now. Do not ask optional follow-up questions such as priority or tenancy; place those as assumptions/trade-offs inside the alternatives.",
+        readiness.product_type.as_deref().unwrap_or(""),
+        readiness.target_users.as_deref().unwrap_or(""),
+        readiness.core_problem.as_deref().unwrap_or(""),
+        readiness.key_features.join("|"),
+        readiness.constraints.join("|"),
+        readiness.summary_presented,
+        readiness.summary_confirmed,
+        missing,
+        latest_user_confirmed
     )
 }
 
 fn contract_repair_trigger(error: &str) -> &'static str {
     match error {
+        "agent_response_not_json" => "contract_repair",
         "agent_solution_role_rationale_missing" => "contract_repair_missing_role_rationale",
         "agent_solutions_unstructured_markdown" => "contract_repair_unstructured_solutions",
         _ => "contract_repair",
@@ -1030,6 +1532,17 @@ fn contract_repair_trigger(error: &str) -> &'static str {
 }
 
 fn is_repairable_agent_contract_error(error: &str) -> bool {
+    matches!(
+        error,
+        "agent_response_not_json"
+            | "agent_solution_role_rationale_missing"
+            | "agent_solutions_missing"
+            | "agent_solutions_must_be_three"
+            | "agent_solutions_unstructured_markdown"
+    )
+}
+
+fn is_immediate_agent_contract_error(error: &str) -> bool {
     matches!(
         error,
         "agent_solution_role_rationale_missing"
@@ -1045,10 +1558,13 @@ fn agent_contract_repair_instruction(trigger: Option<&str>) -> &'static str {
             "Your previous solutions response was rejected because at least one solution missed roleRationale or omittedRoleRationale. Do not ask the user to repeat anything. Reuse the existing conversation context and output exactly three complete solutions now, each with roleRationale and omittedRoleRationale."
         }
         Some("contract_repair_unstructured_solutions") => {
-            "Your previous response described 方案A/方案B/方案C in Markdown instead of returning the required structured JSON. Do not ask the user to choose in chat. Reuse the existing conversation context and output JSON only: mode=solutions, exactly three items in solutions[], and every solution must include architectureSummary, teamComposition, tokenEstimate, recommendationText, roleRationale, and omittedRoleRationale."
+            "Your previous response described 方案A/方案B/方案C in Markdown instead of returning the required structured JSON. Do not ask the user to choose in chat. Do not output <solution-picker-agent> or any other pseudo tool call; the desktop program opens the solution selector after parsing solutions[]. Reuse the existing conversation context and output JSON only. Return mode=solutions and solutions[] now. Follow this contract exactly: Return exactly one complete, valid JSON object and nothing else. Hard requirements: Output must be raw JSON only. Do not include Markdown, bullet lists, XML/HTML tags, YAML, code fences, commentary, explanatory prose, or any text before or after the JSON object. Do not include pseudo tool calls or agent tags such as <solution-picker-agent>. Ensure the JSON is syntactically valid and fully parseable by a desktop program. Include mode with the exact string value \"solutions\". Include solutions as a JSON array at the top level. Do not omit mode or solutions[]. Minimum acceptance criteria: The response parses as JSON without errors. The top-level object contains \"mode\": \"solutions\" and \"solutions\": [] or a populated solutions array. Exactly three solution items are required, and every solution must include architectureSummary, teamComposition, tokenEstimate, recommendationText, roleRationale, and omittedRoleRationale."
         }
         Some("contract_repair") => {
-            "Your previous solutions response did not satisfy the required JSON contract. Do not ask the user to repeat anything. Reuse the existing conversation context and output the corrected JSON now."
+            "Your previous response did not satisfy the required JSON contract. Do not ask the user to repeat anything. Reuse the existing conversation context and output the corrected JSON now. Return exactly one complete, valid JSON object and nothing else. Hard requirements: Output must be raw JSON only. Do not include Markdown, bullet lists, XML/HTML tags, YAML, code fences, commentary, explanatory prose, or any text before or after the JSON object. Do not include pseudo tool calls or agent tags such as <solution-picker-agent>. Ensure the JSON is syntactically valid and fully parseable by a desktop program. Include mode with the exact string value \"question\" or \"solutions\". Include readiness when reporting discovery state. If mode is \"solutions\", include solutions as a JSON array at the top level. Do not omit mode or solutions[] when mode is \"solutions\". Minimum acceptance criteria: The response parses as JSON without errors. The top-level object contains \"mode\". If mode is \"solutions\", the top-level object contains \"mode\": \"solutions\" and \"solutions\": [] or a populated solutions array."
+        }
+        Some("contract_repair_confirmed_solutions") => {
+            "The user has explicitly confirmed the presented understanding, and the required product fields are already present. Do not ask new optional scoping questions. Encode assumptions and trade-offs inside the three alternatives. Respond with JSON only: mode=solutions and exactly three solutions, each with architectureSummary, teamComposition, tokenEstimate, recommendationText, roleRationale, and omittedRoleRationale. Follow this contract exactly: Return exactly one complete, valid JSON object and nothing else. Output must be raw JSON only. Do not include Markdown, bullet lists, XML/HTML tags, YAML, code fences, commentary, explanatory prose, pseudo tool calls, or agent tags such as <solution-picker-agent>."
         }
         _ => "",
     }
@@ -1159,10 +1675,11 @@ fn build_chat_completions_messages(session: &AgentSession, trigger: Option<&str>
 
 fn build_minimal_agent_prompt(session: &AgentSession, trigger: Option<&str>) -> String {
     format!(
-        "You are 梦星星, the main initialization agent for 星星的vibecoding启动器. Current provider: {}. Current workspace: {}. Trigger: {}. Understand the user's product idea first, ask natural follow-up questions, and do not output solutions until product type, target users, core problem, key features, and constraints are complete and the user explicitly confirms your summary. After confirmation, output exactly three solutions. Each solution must include roleRationale and omittedRoleRationale so 星梦梦 can review your role choices. Solutions are implementation plans for a later handoff; do not claim the generated init package already contains finished business code. Codex or Claude Code are only handoff clients, not deployment or runtime platforms. Respond with JSON only using this shape: {{\"mode\":\"question|solutions\",\"assistantMessage\":\"...\",\"understandingSummary\":\"...\",\"readiness\":{{\"productType\":\"...\",\"targetUsers\":\"...\",\"coreProblem\":\"...\",\"keyFeatures\":[\"...\"],\"constraints\":[\"...\"],\"summaryPresented\":true,\"summaryConfirmed\":false,\"missingFields\":[\"...\"],\"readyForSolutions\":false}},\"solutions\":[{{\"id\":\"A\",\"title\":\"...\",\"architectureSummary\":\"...\",\"teamComposition\":[\"...\"],\"tokenEstimate\":\"...\",\"recommendationText\":\"...\",\"roleRationale\":{{\"frontend\":\"why this role is needed\"}},\"omittedRoleRationale\":{{\"qa\":\"why this plausible role is not selected yet\"}}}}]}}",
+        "You are 梦星星, the main initialization agent for 星星的vibecoding启动器. Current provider: {}. Current workspace: {}. Trigger: {}. Understand the user's product idea first, ask natural follow-up questions, and do not output solutions until product type, target users, core problem, key features, and constraints are complete and the user explicitly confirms your summary. After confirmation, output exactly three solutions. Each solution must include roleRationale and omittedRoleRationale so 星梦梦 can review your role choices. Solutions are implementation plans for a later handoff; do not claim the generated init package already contains finished business code. Codex or Claude Code are only handoff clients, not deployment or runtime platforms. {} Respond with JSON only using this shape: {{\"mode\":\"question|solutions\",\"assistantMessage\":\"...\",\"understandingSummary\":\"...\",\"readiness\":{{\"productType\":\"...\",\"targetUsers\":\"...\",\"coreProblem\":\"...\",\"keyFeatures\":[\"...\"],\"constraints\":[\"...\"],\"summaryPresented\":true,\"summaryConfirmed\":false,\"missingFields\":[\"...\"],\"readyForSolutions\":false}},\"solutions\":[{{\"id\":\"A\",\"title\":\"...\",\"architectureSummary\":\"...\",\"teamComposition\":[\"...\"],\"tokenEstimate\":\"...\",\"recommendationText\":\"...\",\"roleRationale\":{{\"frontend\":\"why this role is needed\"}},\"omittedRoleRationale\":{{\"qa\":\"why this plausible role is not selected yet\"}}}}]}}",
         session.provider,
         session.workspace_path,
         trigger.unwrap_or("session_start"),
+        agent_json_contract_instruction(),
     )
 }
 
@@ -1242,33 +1759,119 @@ fn post_agent_json(
     endpoint: &str,
     api_key: &str,
     request_body: &Value,
+    call_log_context: Option<&AgentCallLogContext>,
 ) -> Result<Value, AgentHttpError> {
     let response = client
         .post(endpoint)
         .bearer_auth(api_key)
         .json(request_body)
         .send()
-        .map_err(|error| AgentHttpError {
-            status_code: 0,
-            body: error.to_string(),
-            endpoint: Some(endpoint.to_string()),
+        .map_err(|error| {
+            let error_text = error.to_string();
+            append_agent_call_log(
+                call_log_context,
+                endpoint,
+                request_body,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&error_text),
+            );
+            AgentHttpError {
+                status_code: 0,
+                body: error_text,
+                endpoint: Some(endpoint.to_string()),
+            }
         })?;
 
     let status = response.status();
     let status_code = status.as_u16();
     let success = status.is_success();
-    let body = response.text().unwrap_or_default();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(error) => {
+            let detail = error.to_string();
+            append_agent_call_log(
+                call_log_context,
+                endpoint,
+                request_body,
+                Some(status_code),
+                content_type.as_deref(),
+                None,
+                None,
+                None,
+                Some(&detail),
+            );
+            return Err(AgentHttpError {
+                status_code,
+                body: format!(
+                    "response_body_read_failed reason={}",
+                    sanitize_agent_error_detail(&detail)
+                ),
+                endpoint: Some(endpoint.to_string()),
+            });
+        }
+    };
     if success {
-        return parse_successful_agent_response_text(&body).map_err(|reason| AgentHttpError {
-            status_code,
-            body: format!(
-                "invalid_json reason={} bodySnippet={}",
-                reason,
-                sanitize_agent_error_detail(&body)
-            ),
-            endpoint: Some(endpoint.to_string()),
-        });
+        match parse_successful_agent_response_text(&body) {
+            Ok(value) => {
+                append_agent_call_log(
+                    call_log_context,
+                    endpoint,
+                    request_body,
+                    Some(status_code),
+                    content_type.as_deref(),
+                    Some(&body),
+                    Some(&value),
+                    None,
+                    None,
+                );
+                return Ok(value);
+            }
+            Err(reason) => {
+                append_agent_call_log(
+                    call_log_context,
+                    endpoint,
+                    request_body,
+                    Some(status_code),
+                    content_type.as_deref(),
+                    Some(&body),
+                    None,
+                    Some(&reason),
+                    None,
+                );
+                return Err(AgentHttpError {
+                    status_code,
+                    body: format!(
+                        "invalid_json reason={} bodySnippet={}",
+                        reason,
+                        sanitize_agent_error_detail(&body)
+                    ),
+                    endpoint: Some(endpoint.to_string()),
+                });
+            }
+        }
     }
+
+    let parsed_error_body = serde_json::from_str::<Value>(&body).ok();
+    append_agent_call_log(
+        call_log_context,
+        endpoint,
+        request_body,
+        Some(status_code),
+        content_type.as_deref(),
+        Some(&body),
+        parsed_error_body.as_ref(),
+        None,
+        None,
+    );
 
     Err(AgentHttpError {
         status_code,
@@ -1292,6 +1895,14 @@ fn map_agent_http_error(error: &AgentHttpError) -> String {
         let endpoint = error.endpoint.as_deref().unwrap_or("unknown");
         return format!(
             "agent_response_invalid status=200 endpoint={} {}",
+            endpoint,
+            sanitize_agent_error_detail(&error.body)
+        );
+    }
+    if error.status_code == 200 && error.body.starts_with("response_body_read_failed") {
+        let endpoint = error.endpoint.as_deref().unwrap_or("unknown");
+        return format!(
+            "模型请求失败：模型服务已返回响应头，但正文读取失败或超时。endpoint={} {}",
             endpoint,
             sanitize_agent_error_detail(&error.body)
         );
@@ -1433,12 +2044,58 @@ fn parse_agent_decision_response(value: &Value) -> Result<AgentDecision, String>
     for raw_content in candidates {
         match parse_agent_decision_content(&raw_content) {
             Ok(decision) => return Ok(decision),
-            Err(error) if is_repairable_agent_contract_error(&error) => return Err(error),
+            Err(error) if is_immediate_agent_contract_error(&error) => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
 
     Err(last_error.unwrap_or_else(|| "agent_response_missing_content".to_string()))
+}
+
+fn parse_agent_decision_response_for_provider(
+    value: &Value,
+    provider: &str,
+) -> Result<AgentDecision, String> {
+    if !provider_allows_minimax_reasoning_cleanup(provider) {
+        return parse_agent_decision_response(value);
+    }
+
+    let mut candidates = Vec::new();
+    collect_text_candidates(value, &mut candidates);
+    let mut last_error: Option<String> = None;
+
+    for raw_content in candidates {
+        if let Some(cleaned) = strip_reasoning_think_blocks(&raw_content) {
+            let cleaned = cleaned.trim();
+            if !cleaned.is_empty() && cleaned != raw_content.trim() {
+                match parse_agent_decision_content(cleaned) {
+                    Ok(decision) => return Ok(decision),
+                    Err(error) if is_immediate_agent_contract_error(&error) => return Err(error),
+                    Err(error) => {
+                        last_error = Some(error);
+                        if looks_like_json_candidate(cleaned) {
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                last_error = Some("agent_response_not_json".to_string());
+            }
+            continue;
+        }
+
+        match parse_agent_decision_content(&raw_content) {
+            Ok(decision) => return Ok(decision),
+            Err(error) if is_immediate_agent_contract_error(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "agent_response_missing_content".to_string()))
+}
+
+fn provider_allows_minimax_reasoning_cleanup(provider: &str) -> bool {
+    provider.trim().eq_ignore_ascii_case("custom")
 }
 
 fn should_retry_agent_parse_with_chat_fallback(error: &str) -> bool {
@@ -1478,49 +2135,113 @@ fn collect_text_candidates(value: &Value, candidates: &mut Vec<String>) {
 }
 
 fn parse_agent_decision_content(raw_content: &str) -> Result<AgentDecision, String> {
-    if looks_like_agent_decision_json(raw_content) {
-        return parse_agent_decision_json(raw_content);
-    }
-
-    if let Ok(decision) = parse_agent_decision_json(raw_content) {
-        return Ok(decision);
-    }
-
-    if let Ok(encoded) = serde_json::from_str::<String>(raw_content) {
-        if looks_like_agent_decision_json(&encoded) {
-            return parse_agent_decision_json(&encoded);
-        }
-        if let Ok(decision) = parse_agent_decision_json(&encoded) {
-            return Ok(decision);
-        }
-        if let Some(candidate) = extract_json_object(&encoded) {
-            if looks_like_agent_decision_json(&candidate) {
-                return parse_agent_decision_json(&candidate);
-            }
-            if let Ok(decision) = parse_agent_decision_json(&candidate) {
-                return Ok(decision);
-            }
-        }
-    }
-
-    if let Some(candidate) = extract_json_object(raw_content) {
-        if looks_like_agent_decision_json(&candidate) {
-            return parse_agent_decision_json(&candidate);
-        }
-        if let Ok(decision) = parse_agent_decision_json(&candidate) {
-            return Ok(decision);
-        }
-    }
-
     if looks_like_unstructured_solution_bundle(raw_content) {
         return Err("agent_solutions_unstructured_markdown".to_string());
     }
 
-    if let Some(fallback) = fallback_decision_from_plain_text(raw_content) {
+    let trimmed = raw_content.trim();
+    if trimmed.is_empty() || trimmed.starts_with('<') {
+        return Err("agent_response_not_json".to_string());
+    }
+
+    if is_raw_json_object_text(trimmed) {
+        return parse_agent_decision_json(trimmed);
+    }
+
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Err("agent_response_not_json".to_string());
+    }
+
+    if let Ok(encoded) = serde_json::from_str::<String>(trimmed) {
+        match parse_non_raw_agent_decision_candidate(&encoded) {
+            Ok(decision) => return Ok(decision),
+            Err(error) if is_immediate_agent_contract_error(&error) => return Err(error),
+            Err(_) => {}
+        }
+        if looks_like_json_candidate(&encoded) {
+            return Err("agent_response_not_json".to_string());
+        }
+    }
+
+    match parse_non_raw_agent_decision_candidate(trimmed) {
+        Ok(decision) => return Ok(decision),
+        Err(error) if is_immediate_agent_contract_error(&error) => return Err(error),
+        Err(_) => {}
+    }
+
+    if looks_like_json_candidate(trimmed) || trimmed.starts_with('"') {
+        return Err("agent_response_not_json".to_string());
+    }
+
+    if let Some(fallback) = fallback_decision_from_plain_text(trimmed) {
         return Ok(fallback);
     }
 
     Err("agent_response_not_json".to_string())
+}
+
+fn parse_non_raw_agent_decision_candidate(raw_content: &str) -> Result<AgentDecision, String> {
+    if looks_like_unstructured_solution_bundle(raw_content) {
+        return Err("agent_solutions_unstructured_markdown".to_string());
+    }
+
+    let trimmed = raw_content.trim();
+    if trimmed.is_empty() || trimmed.starts_with('<') {
+        return Err("agent_response_not_json".to_string());
+    }
+
+    if is_raw_json_object_text(trimmed) {
+        let decision = parse_agent_decision_json(trimmed)?;
+        return reject_non_raw_solutions(decision);
+    }
+
+    if let Some(candidate) = extract_json_object(trimmed) {
+        let decision = parse_agent_decision_json(&candidate)?;
+        return reject_non_raw_solutions(decision);
+    }
+
+    Err("agent_response_not_json".to_string())
+}
+
+fn reject_non_raw_solutions(decision: AgentDecision) -> Result<AgentDecision, String> {
+    if decision.mode == "solutions" {
+        Err("agent_solutions_unstructured_markdown".to_string())
+    } else {
+        Ok(decision)
+    }
+}
+
+fn is_raw_json_object_text(raw_content: &str) -> bool {
+    let trimmed = raw_content.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}')
+}
+
+fn strip_reasoning_think_blocks(raw_content: &str) -> Option<String> {
+    strip_leading_xml_like_blocks(raw_content, "think")
+}
+
+fn strip_leading_xml_like_blocks(raw_content: &str, tag: &str) -> Option<String> {
+    let open_tag = format!("<{tag}>");
+    let close_tag = format!("</{tag}>");
+    let mut remaining = raw_content;
+    let mut changed = false;
+
+    loop {
+        let trimmed = remaining.trim_start();
+        let trimmed_lower = trimmed.to_ascii_lowercase();
+        if !trimmed_lower.starts_with(&open_tag) {
+            return changed.then(|| trimmed.to_string());
+        }
+
+        changed = true;
+        let after_open_index = open_tag.len();
+        let after_open_lower = &trimmed_lower[after_open_index..];
+        let Some(close_relative_index) = after_open_lower.find(&close_tag) else {
+            return Some(String::new());
+        };
+        let after_close_index = after_open_index + close_relative_index + close_tag.len();
+        remaining = &trimmed[after_close_index..];
+    }
 }
 
 fn parse_agent_decision_json(raw_content: &str) -> Result<AgentDecision, String> {
@@ -1528,13 +2249,6 @@ fn parse_agent_decision_json(raw_content: &str) -> Result<AgentDecision, String>
         .map_err(|_| "agent_response_not_json".to_string())?;
     validate_agent_decision_contract(&decision)?;
     Ok(decision)
-}
-
-fn looks_like_agent_decision_json(raw_content: &str) -> bool {
-    serde_json::from_str::<Value>(raw_content)
-        .ok()
-        .and_then(|value| value.get("mode").cloned())
-        .is_some()
 }
 
 fn validate_agent_decision_contract(decision: &AgentDecision) -> Result<(), String> {
@@ -1561,11 +2275,13 @@ fn validate_solution_rationale(solutions: &[AgentSolution]) -> Result<(), String
 
 fn fallback_decision_from_plain_text(raw_content: &str) -> Option<AgentDecision> {
     let trimmed = raw_content.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if trimmed.starts_with('<') || trimmed.starts_with("```html") {
+    if trimmed.is_empty()
+        || trimmed.starts_with('<')
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('"')
+        || trimmed.starts_with("```")
+    {
         return None;
     }
 
@@ -1612,7 +2328,9 @@ fn looks_like_unstructured_solution_bundle(content: &str) -> bool {
         || normalized.contains("omittedrolerationale");
     let asks_chat_selection = content.contains("请选择")
         || content.contains("选择偏好")
+        || content.contains("选中推荐方案")
         || content.contains("A/B/C")
+        || normalized.contains("solution-picker-agent")
         || normalized.contains("choose");
 
     solution_marker_count >= 3 && has_team_payload && asks_chat_selection
@@ -1744,6 +2462,7 @@ fn merge_readiness(
     incoming: Option<AgentReadiness>,
     messages: &[AgentMessage],
     summary_hint: Option<&str>,
+    provider: &str,
 ) -> AgentReadiness {
     let mut readiness =
         incoming.unwrap_or_else(|| infer_readiness_from_messages(messages, summary_hint));
@@ -1760,7 +2479,8 @@ fn merge_readiness(
         .map(|message| message.content.as_str())
         .unwrap_or_default();
     let summary_confirmed = current.summary_confirmed
-        || (summary_presented && is_explicit_confirmation_message(latest_user));
+        || (summary_presented
+            && is_explicit_confirmation_message_for_provider(provider, latest_user));
 
     if readiness.product_type.is_none() {
         readiness.product_type = current.product_type.clone();
@@ -1783,6 +2503,26 @@ fn merge_readiness(
     readiness.ready_for_solutions =
         readiness.missing_fields.is_empty() && readiness.summary_confirmed;
     readiness
+}
+
+fn readiness_has_required_details(readiness: &AgentReadiness) -> bool {
+    readiness
+        .product_type
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        && readiness
+            .target_users
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        && readiness
+            .core_problem
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        && !readiness.key_features.is_empty()
+        && !readiness.constraints.is_empty()
 }
 
 fn infer_readiness_from_messages(
@@ -1911,11 +2651,27 @@ fn assistant_has_presented_summary(messages: &[AgentMessage]) -> bool {
     })
 }
 
+fn latest_user_message(messages: &[AgentMessage]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+}
+
+fn is_explicit_confirmation_message_for_provider(provider: &str, message: &str) -> bool {
+    is_explicit_confirmation_message(message)
+        || (provider_allows_minimax_reasoning_cleanup(provider)
+            && is_custom_compact_confirmation_message(message))
+}
+
+fn is_custom_compact_confirmation_message(message: &str) -> bool {
+    let normalized = normalize_confirmation_text(message);
+    normalized == "准确" || normalized == "确认准确"
+}
+
 fn is_explicit_confirmation_message(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .replace(['。', '，', ',', '！', '!', '？', '?', ' '], "")
-        .to_lowercase();
+    let normalized = normalize_confirmation_text(message);
 
     if normalized.is_empty() {
         return false;
@@ -1927,6 +2683,10 @@ fn is_explicit_confirmation_message(message: &str) -> bool {
         "不准确",
         "不行",
         "不可以",
+        "不确定",
+        "不确认",
+        "不能确定",
+        "还不能确认",
         "还不对",
         "有问题",
     ];
@@ -1935,6 +2695,14 @@ fn is_explicit_confirmation_message(message: &str) -> bool {
         .any(|marker| normalized.contains(marker))
     {
         return false;
+    }
+
+    let compact_positive_markers = ["准确", "确认准确", "确定", "确认", "没问题"];
+    if compact_positive_markers
+        .iter()
+        .any(|marker| normalized == *marker)
+    {
+        return true;
     }
 
     let positive_markers = [
@@ -1954,6 +2722,13 @@ fn is_explicit_confirmation_message(message: &str) -> bool {
     positive_markers
         .iter()
         .any(|marker| normalized.contains(marker))
+}
+
+fn normalize_confirmation_text(message: &str) -> String {
+    message
+        .trim()
+        .replace(['。', '，', ',', '！', '!', '？', '?', ' '], "")
+        .to_lowercase()
 }
 
 fn build_readiness_summary(readiness: &AgentReadiness) -> String {
@@ -2313,6 +3088,8 @@ fn normalize_repaired_solution_rationale(solution: &mut AgentSolution) {
 
     if token_estimate_needs_package_budget_normalization(&solution.token_estimate) {
         solution.token_estimate = default_package_token_estimate();
+    } else if token_estimate_understates_complex_package(solution) {
+        solution.token_estimate = default_complex_package_token_estimate(solution);
     }
 }
 
@@ -2336,12 +3113,24 @@ fn docs_rationale_has_valid_codex_plan(rationale: &str) -> bool {
     let marks_as_planned = rationale.contains("计划")
         || rationale.contains("将在")
         || rationale.to_ascii_lowercase().contains("bootstrap");
+    let distinguishes_phase = rationale.contains("当前")
+        && (rationale.contains("后续")
+            || rationale.contains("将在")
+            || rationale.contains("计划")
+            || rationale.to_ascii_lowercase().contains("bootstrap"));
+    let avoids_docs_as_generator = !rationale.contains("负责在 bootstrap 阶段生成")
+        && !rationale.contains("将在 bootstrap 阶段为目标软件")
+        && !rationale.contains("负责生成目标软件");
     let falsely_claims_existing = rationale.contains("已生成")
         || rationale.contains("已存在")
         || rationale.contains("已经生成")
         || rationale.contains("已经存在");
 
-    mentions_codex_entries && marks_as_planned && !falsely_claims_existing
+    mentions_codex_entries
+        && marks_as_planned
+        && distinguishes_phase
+        && avoids_docs_as_generator
+        && !falsely_claims_existing
 }
 
 fn ensure_product_manager_omission_alignment(solution: &mut AgentSolution) {
@@ -2365,12 +3154,16 @@ fn ensure_product_manager_omission_alignment(solution: &mut AgentSolution) {
             .role_rationale
             .entry("architect".to_string())
             .or_insert(default_rationale);
-        if !architect_rationale.contains("产品")
-            && !architect_rationale.contains("优先级")
-            && !architect_rationale.contains("范围控制")
+        strip_generic_product_manager_assignment(architect_rationale);
+        if !architect_rationale.contains("需求梳理")
+            || !architect_rationale.contains("用户故事优先级")
+            || !architect_rationale.contains("MVP")
+            || !architect_rationale.contains("范围")
         {
-            architect_rationale
-                .push_str("；承接产品经理职责，负责需求优先级、干系人沟通和范围控制。");
+            append_rationale_clause(
+                architect_rationale,
+                "承接产品经理职责，负责需求梳理、用户故事优先级、MVP 范围把控、企业询价流程取舍和产品决策闭环",
+            );
         }
     }
 
@@ -2381,8 +3174,10 @@ fn ensure_product_manager_omission_alignment(solution: &mut AgentSolution) {
             .entry("reviewer".to_string())
             .or_insert(default_rationale);
         if !reviewer_rationale.contains("范围漂移") {
-            reviewer_rationale
-                .push_str("；在产品经理不单独生成时复核需求范围漂移和方案取舍一致性。");
+            append_rationale_clause(
+                reviewer_rationale,
+                "在产品经理不单独生成时复核需求范围漂移和方案取舍一致性",
+            );
         }
     }
 
@@ -2405,6 +3200,8 @@ fn ensure_reviewer_qa_scope_separation(solution: &mut AgentSolution) {
         let lower = reviewer_rationale.to_ascii_lowercase();
         if !reviewer_rationale.contains("语义复核")
             || !reviewer_rationale.contains("范围漂移")
+            || !reviewer_rationale.contains("目标软件协作包")
+            || !reviewer_rationale.contains("星梦梦")
             || reviewer_rationale.contains("技术回归")
             || lower.contains("qa")
         {
@@ -2614,7 +3411,7 @@ fn normalize_low_code_solution_roles(solution: &mut AgentSolution) {
                     .to_string();
         } else if role.contains("UI") || role.contains("设计师") {
             *rationale =
-                "UI 设计职责并入 frontend 角色，由 frontend 负责低代码平台管理后台组件配置、视觉一致性和基础交互。"
+                "UI/UX 设计职责由 frontend 与 miniapp 分担：frontend 负责 Web/后台视觉一致性和组件配置，miniapp 负责小程序端页面与端侧交互，architect 把控体验优先级与范围取舍。"
                     .to_string();
         }
     }
@@ -2709,8 +3506,7 @@ fn propagate_omitted_role_assignments_to_owner_roles(solution: &mut AgentSolutio
             if !owner_rationale.contains(&addition)
                 && !omitted_assignment_already_covered(owner_rationale, &omitted_role, &rationale)
             {
-                owner_rationale.push_str("；");
-                owner_rationale.push_str(&addition);
+                append_rationale_clause(owner_rationale, &addition);
             }
         }
     }
@@ -2752,6 +3548,8 @@ fn omitted_assignment_summary(omitted_role: &str, rationale: &str) -> String {
         || rationale.contains("UI/UX")
     {
         "承接 UI/UX 设计职责".to_string()
+    } else if canonical_role_from_label(omitted_role) == "product-manager" {
+        "承接产品经理职责，负责需求梳理、用户故事优先级、MVP 范围把控和产品决策".to_string()
     } else {
         format!("承接 {} 的并入职责", omitted_role)
     }
@@ -2769,6 +3567,48 @@ fn omitted_assignment_already_covered(
         || (rationale.contains("钉钉") && owner_rationale.contains("钉钉"))
         || (rationale.contains("飞书") && owner_rationale.contains("飞书"))
         || (rationale.contains("快速原型") && owner_rationale.contains("快速原型"))
+        || (canonical_role_from_label(omitted_role) == "product-manager"
+            && owner_rationale.contains("产品经理"))
+}
+
+fn append_rationale_clause(rationale: &mut String, addition: &str) {
+    let trimmed = rationale
+        .trim()
+        .trim_end_matches(['。', '；', ';'])
+        .trim()
+        .to_string();
+    *rationale = trimmed;
+    let addition = addition
+        .trim()
+        .trim_start_matches(['。', '；', ';'])
+        .trim_end_matches(['。', '；', ';'])
+        .trim();
+    if addition.is_empty() {
+        return;
+    }
+    if !rationale.is_empty() {
+        rationale.push('；');
+    }
+    rationale.push_str(addition);
+    rationale.push('。');
+}
+
+fn strip_generic_product_manager_assignment(rationale: &mut String) {
+    for pattern in [
+        "；承接 产品经理 的并入职责",
+        ";承接 产品经理 的并入职责",
+        "；承接产品经理的并入职责",
+        ";承接产品经理的并入职责",
+        "承接 产品经理 的并入职责",
+        "承接产品经理的并入职责",
+    ] {
+        *rationale = rationale.replace(pattern, "");
+    }
+    *rationale = rationale
+        .replace("。；", "；")
+        .replace("；。", "。")
+        .trim()
+        .to_string();
 }
 
 fn normalize_business_architecture_summary(solution: &mut AgentSolution) {
@@ -2805,6 +3645,18 @@ fn token_estimate_needs_package_budget_normalization(token_estimate: &str) -> bo
         || token_estimate.contains("整体约")
         || !token_estimate.contains("不包含")
         || !(lower.contains("token") || token_estimate.contains("预算"))
+}
+
+fn token_estimate_understates_complex_package(solution: &AgentSolution) -> bool {
+    let role_count = solution
+        .team_composition
+        .len()
+        .max(solution.role_rationale.len());
+    role_count >= 8
+        && (solution.token_estimate.contains("10 万")
+            || solution.token_estimate.contains("10万")
+            || solution.token_estimate.contains("100K")
+            || solution.token_estimate.contains("100k"))
 }
 
 fn normalize_role_key(value: &str) -> String {
@@ -2965,18 +3817,24 @@ fn request_semantic_json(
             "input": format!("{prompt}\n\n{payload_text}")
         });
 
-        match post_agent_json(
+        match post_session_agent_json(
             &client,
+            session,
+            "semantic",
+            None,
+            "semantic.responses.primary",
             &responses_endpoint,
-            &session.api_key,
             &responses_request,
         ) {
             Ok(value) => value,
             Err(error) if error.status_code == 400 => {
-                match post_agent_json(
+                match post_session_agent_json(
                     &client,
+                    session,
+                    "semantic",
+                    None,
+                    "semantic.responses.compat",
                     &responses_endpoint,
-                    &session.api_key,
                     &responses_fallback_request,
                 ) {
                     Ok(value) => value,
@@ -2985,8 +3843,8 @@ fn request_semantic_json(
                     {
                         post_semantic_chat_json(
                             &client,
+                            session,
                             &chat_endpoint,
-                            &session.api_key,
                             &chat_request,
                             &chat_fallback_request,
                         )?
@@ -2997,8 +3855,8 @@ fn request_semantic_json(
             Err(error) if should_fallback_from_responses_to_chat(&error) => {
                 post_semantic_chat_json(
                     &client,
+                    session,
                     &chat_endpoint,
-                    &session.api_key,
                     &chat_request,
                     &chat_fallback_request,
                 )?
@@ -3008,13 +3866,15 @@ fn request_semantic_json(
     } else {
         post_semantic_chat_json(
             &client,
+            session,
             &chat_endpoint,
-            &session.api_key,
             &chat_request,
             &chat_fallback_request,
         )?
     };
-    if let Some(parsed) = extract_json_value_from_model_response(&value) {
+    if let Some(parsed) =
+        extract_json_value_from_model_response_for_provider(&value, &session.provider)
+    {
         return Ok(parsed);
     }
     if let Some(recovered) = recover_semantic_review_value_from_invalid_response(&value) {
@@ -3114,17 +3974,31 @@ fn session_uses_codex_official_login(session: &AgentSession) -> bool {
 
 fn post_semantic_chat_json(
     client: &Client,
+    session: &AgentSession,
     endpoint: &str,
-    api_key: &str,
     primary_request: &Value,
     fallback_request: &Value,
 ) -> Result<Value, String> {
-    match post_agent_json(client, endpoint, api_key, primary_request) {
+    match post_session_agent_json(
+        client,
+        session,
+        "semantic",
+        None,
+        "semantic.chat.primary",
+        endpoint,
+        primary_request,
+    ) {
         Ok(value) => Ok(value),
-        Err(error) if error.status_code == 400 => {
-            post_agent_json(client, endpoint, api_key, fallback_request)
-                .map_err(|fallback_error| map_agent_http_error(&fallback_error))
-        }
+        Err(error) if error.status_code == 400 => post_session_agent_json(
+            client,
+            session,
+            "semantic",
+            None,
+            "semantic.chat.compat",
+            endpoint,
+            fallback_request,
+        )
+        .map_err(|fallback_error| map_agent_http_error(&fallback_error)),
         Err(error) => Err(map_agent_http_error(&error)),
     }
 }
@@ -3133,6 +4007,36 @@ fn extract_json_value_from_model_response(value: &Value) -> Option<Value> {
     let mut candidates = Vec::new();
     collect_text_candidates(value, &mut candidates);
     for raw_content in candidates {
+        if let Ok(parsed) = parse_json_candidate_value(&raw_content) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn extract_json_value_from_model_response_for_provider(
+    value: &Value,
+    provider: &str,
+) -> Option<Value> {
+    if !provider_allows_minimax_reasoning_cleanup(provider) {
+        return extract_json_value_from_model_response(value);
+    }
+
+    let mut candidates = Vec::new();
+    collect_text_candidates(value, &mut candidates);
+    for raw_content in candidates {
+        if let Ok(parsed) = parse_complete_json_candidate_value(&raw_content) {
+            return Some(parsed);
+        }
+        if let Some(cleaned) = strip_reasoning_think_blocks(&raw_content) {
+            if let Ok(parsed) =
+                parse_json_candidate_value_embedded(&cleaned).and_then(unwind_json_string_values)
+            {
+                return Some(parsed);
+            }
+            continue;
+        }
+
         if let Ok(parsed) = parse_json_candidate_value(&raw_content) {
             return Some(parsed);
         }
@@ -3249,17 +4153,33 @@ fn find_review_issues_field_start(text: &str) -> Option<usize> {
 }
 
 fn parse_json_candidate_value(raw_content: &str) -> Result<Value, String> {
-    let trimmed = raw_content.trim();
-    let without_fence = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(|value| value.trim_end_matches("```").trim())
-        .unwrap_or(trimmed);
-    let mut value = parse_json_value_or_embedded_object(without_fence)?;
+    parse_json_candidate_value_embedded(raw_content).and_then(unwind_json_string_values)
+}
+
+fn parse_complete_json_candidate_value(raw_content: &str) -> Result<Value, String> {
+    serde_json::from_str::<Value>(json_candidate_without_fence(raw_content))
+        .map_err(|_| "json_candidate_invalid".to_string())
+        .and_then(unwind_json_string_values)
+}
+
+fn unwind_json_string_values(mut value: Value) -> Result<Value, String> {
     while let Value::String(inner) = value {
         value = parse_json_value_or_embedded_object(&inner)?;
     }
     Ok(value)
+}
+
+fn json_candidate_without_fence(raw_content: &str) -> &str {
+    let trimmed = raw_content.trim();
+    trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|value| value.trim_end_matches("```").trim())
+        .unwrap_or(trimmed)
+}
+
+fn parse_json_candidate_value_embedded(raw_content: &str) -> Result<Value, String> {
+    parse_json_value_or_embedded_object(json_candidate_without_fence(raw_content))
 }
 
 fn parse_json_value_or_embedded_object(raw_content: &str) -> Result<Value, String> {
@@ -3270,6 +4190,11 @@ fn parse_json_value_or_embedded_object(raw_content: &str) -> Result<Value, Strin
     extract_json_object(trimmed)
         .and_then(|candidate| serde_json::from_str::<Value>(&candidate).ok())
         .ok_or_else(|| "json_candidate_invalid".to_string())
+}
+
+fn looks_like_json_candidate(raw_content: &str) -> bool {
+    let trimmed = raw_content.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with("```")
 }
 
 fn parse_semantic_review_value(value: &Value) -> Result<SemanticReviewResult, String> {
@@ -4685,8 +5610,8 @@ fn default_package_role_rationale(role: &str, solution: &AgentSolution) -> Strin
     match role {
         "frontend" => "承接梦星星方案中的页面、交互、用户可见路径和基础 UI/UX 取舍；使用选定组件库保证一致性。".to_string(),
         "backend" => "承接接口、数据真源和外部服务集成边界；即使采用托管或低代码后端，也需要在协作包中明确后端责任。".to_string(),
-        "docs" => "维护初始化协作包真源、接手文档和后续实施入口；计划在 bootstrap 阶段生成目标软件（Codex）的后续接管入口文件 AGENTS.md 与 .codex/，具体由 target client 模板落盘并由 postcheck 验证；当前阶段只记录计划，不声称文件已经落盘。".to_string(),
-        "reviewer" => "负责语义复核、角色取舍、方案范围漂移和最终语义验收证据；不承接测试执行或跨端验证。".to_string(),
+        "docs" => "当前负责维护初始化协作包真源、方案决策、角色职责和语义验收记录；后续计划在 bootstrap 阶段生成目标软件接管入口文件 AGENTS.md 与 .codex/，实际落盘由启动器 Codex 模板执行，docs 负责记录交接说明和引用路径，不声称当前文件已经落盘。".to_string(),
+        "reviewer" => "作为目标软件协作包内的后续审查角色，负责实施阶段的语义复核、角色取舍一致性和方案范围漂移检查；星梦梦是启动器本轮初始化验收 Agent，二者阶段不同，reviewer 不替代星梦梦，也不承接 QA 执行职责。".to_string(),
         "devops" => "承接部署、环境变量、CI/CD 和上线回滚边界。".to_string(),
         "architect" => "把梦星星方案中的架构取舍沉淀为可执行实施边界。".to_string(),
         "database" => "负责数据模型、状态一致性、迁移和关键查询边界。".to_string(),
@@ -4698,7 +5623,17 @@ fn default_package_role_rationale(role: &str, solution: &AgentSolution) -> Strin
 }
 
 fn default_package_token_estimate() -> String {
-    "初始化协作包 LLM 预算约 10 万 token：需求/方案梳理约 3 万，星梦梦语义验收与修复约 3 万，目标软件协作包交接文档约 4 万；不包含业务代码生成或业务实现验收。".to_string()
+    "初始化协作包 LLM 预算约 12-16 万 token：需求/方案梳理约 3 万，角色职责与边界约 2-3 万，星梦梦语义验收与修复约 3-4 万，目标软件接管入口与交接文档约 4-5 万，预留复杂度缓冲约 1 万；不包含业务代码生成或业务实现验收。".to_string()
+}
+
+fn default_complex_package_token_estimate(solution: &AgentSolution) -> String {
+    let role_count = solution
+        .team_composition
+        .len()
+        .max(solution.role_rationale.len());
+    format!(
+        "初始化协作包 LLM 预算约 14-18 万 token：需求/方案复核约 3 万，{role_count} 个角色职责与边界约 3 万，跨端/低代码/集成约束说明约 2 万，星梦梦语义验收与修复约 3-5 万，目标软件接管入口与交接文档约 3-4 万，预留复杂度缓冲约 1 万；不包含业务代码生成或业务实现验收。"
+    )
 }
 
 fn default_omitted_package_role_rationale(role: &str) -> String {
@@ -4965,6 +5900,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
     use std::sync::Arc;
     use std::thread;
 
@@ -5026,6 +5962,30 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&temp);
         result
+    }
+
+    fn with_commonhe_runtime_root<T>(runtime_root: &Path, action: impl FnOnce() -> T) -> T {
+        let _guard = crate::commonhe_bridge::test_env_lock();
+        let previous_runtime_root = std::env::var_os("COMMONHE_RUNTIME_ROOT");
+        unsafe {
+            std::env::set_var("COMMONHE_RUNTIME_ROOT", runtime_root);
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(action));
+
+        match previous_runtime_root {
+            Some(previous) => unsafe {
+                std::env::set_var("COMMONHE_RUNTIME_ROOT", previous);
+            },
+            None => unsafe {
+                std::env::remove_var("COMMONHE_RUNTIME_ROOT");
+            },
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     fn spawn_agent_endpoint_capture_server(paths: Arc<TestMutex<Vec<String>>>) -> String {
@@ -5220,6 +6180,342 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn spawn_chat_two_empty_bodies_then_success_server(
+        requests: Arc<TestMutex<Vec<String>>>,
+    ) -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("chat two-empty-body retry server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("chat two-empty-body retry server should expose addr");
+        thread::spawn(move || {
+            for index in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests
+                    .lock()
+                    .expect("request capture lock should not be poisoned")
+                    .push(request);
+
+                let body = if index < 2 {
+                    ""
+                } else {
+                    r#"{"choices":[{"message":{"content":"{\"mode\":\"question\",\"assistantMessage\":\"连续空响应后已恢复。\",\"understandingSummary\":\"用户要做学生管理系统\",\"readiness\":{\"productType\":\"学生管理系统\",\"keyFeatures\":[],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"目标用户\"],\"readyForSolutions\":false}}"}}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.as_bytes().len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn spawn_chat_always_empty_body_server(requests: Arc<TestMutex<Vec<String>>>) -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("chat empty-body server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("chat empty-body server should expose addr");
+        thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                requests
+                    .lock()
+                    .expect("request capture lock should not be poisoned")
+                    .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn spawn_headers_then_delayed_body_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("delayed-body server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("delayed-body server should expose addr");
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(headers.as_bytes());
+            thread::sleep(Duration::from_millis(300));
+            let _ = stream.write_all(br#"{"choices":[{"message":{"content":"late"}}]}"#);
+        });
+        format!("http://{}", addr)
+    }
+
+    fn spawn_chat_plain_text_until_repair_success_server(
+        requests: Arc<TestMutex<Vec<String>>>,
+    ) -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("chat contract repair server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("chat contract repair server should expose addr");
+        thread::spawn(move || {
+            for index in 0..7 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests
+                    .lock()
+                    .expect("request capture lock should not be poisoned")
+                    .push(request.clone());
+
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = if !path.contains("/chat/completions") {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":{"message":"unexpected endpoint"}}"#,
+                    )
+                } else if index < 6 {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"content":"我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？"}}]}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"content":"{\"mode\":\"question\",\"assistantMessage\":\"我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？\",\"understandingSummary\":\"用户想做网站，但目标用户仍需确认。\",\"readiness\":{\"productType\":\"网站\",\"keyFeatures\":[],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"目标用户\"],\"readyForSolutions\":false}}"}}]}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.as_bytes().len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn valid_three_solutions_chat_body() -> String {
+        json!({
+            "choices": [{
+                "message": {
+                    "content": json!({
+                        "mode": "solutions",
+                        "assistantMessage": "已根据确认生成三套方案。",
+                        "understandingSummary": "已确认需求。",
+                        "readiness": {
+                            "productType": "MCP",
+                            "targetUsers": "企业员工",
+                            "coreProblem": "移动端使用受限",
+                            "keyFeatures": ["登录", "聊天", "知识库"],
+                            "constraints": ["Android 8+"],
+                            "summaryPresented": true,
+                            "summaryConfirmed": true,
+                            "missingFields": [],
+                            "readyForSolutions": true
+                        },
+                        "solutions": [
+                            {
+                                "id": "A",
+                                "title": "方案 A",
+                                "architectureSummary": "架构 A",
+                                "teamComposition": ["产品经理", "前端开发者"],
+                                "tokenEstimate": "10k",
+                                "recommendationText": "推荐 A",
+                                "roleRationale": {"产品经理": "负责范围", "前端开发者": "负责实现"},
+                                "omittedRoleRationale": {"QA 测试员": "后续加入"}
+                            },
+                            {
+                                "id": "B",
+                                "title": "方案 B",
+                                "architectureSummary": "架构 B",
+                                "teamComposition": ["产品经理", "后端架构师"],
+                                "tokenEstimate": "12k",
+                                "recommendationText": "推荐 B",
+                                "roleRationale": {"产品经理": "负责范围", "后端架构师": "负责接口"},
+                                "omittedRoleRationale": {"增长黑客": "当前不需要"}
+                            },
+                            {
+                                "id": "C",
+                                "title": "方案 C",
+                                "architectureSummary": "架构 C",
+                                "teamComposition": ["产品经理", "移动应用开发者"],
+                                "tokenEstimate": "14k",
+                                "recommendationText": "推荐 C",
+                                "roleRationale": {"产品经理": "负责范围", "移动应用开发者": "负责 Android"},
+                                "omittedRoleRationale": {"安全工程师": "后续专项处理"}
+                            }
+                        ]
+                    }).to_string()
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    fn spawn_confirmed_summary_then_solutions_server(
+        requests: Arc<TestMutex<Vec<String>>>,
+    ) -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("confirmed solutions server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("confirmed solutions server should expose addr");
+        thread::spawn(move || {
+            for index in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests
+                    .lock()
+                    .expect("request capture lock should not be poisoned")
+                    .push(request.clone());
+
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, body) = if !path.contains("/chat/completions") {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"error":{"message":"unexpected endpoint"}}"#.to_string(),
+                    )
+                } else if index == 0 {
+                    (
+                        "200 OK",
+                        json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "完美，信息已经很充分了。让我总结确认，然后给出方案。\n\n**理解确认：**\n\n| 维度 | 内容 |\n|---|---|\n| 产品 | MengBuildAI 安卓版 |\n\n确认无误。我将基于 Capacitor 混合方案，输出三套差异化的实施方案，供你选择。"
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("200 OK", valid_three_solutions_chat_body())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.as_bytes().len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn spawn_prefaced_fenced_solutions_then_raw_solutions_server(
+        requests: Arc<TestMutex<Vec<String>>>,
+    ) -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("prefaced fenced solutions server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("prefaced fenced solutions server should expose addr");
+        thread::spawn(move || {
+            for index in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests
+                    .lock()
+                    .expect("request capture lock should not be poisoned")
+                    .push(request);
+
+                let body = if index == 0 {
+                    let decision = json!({
+                        "mode": "solutions",
+                        "assistantMessage": "已生成三套方案。",
+                        "readiness": {
+                            "productType": "Android App",
+                            "targetUsers": "企业员工",
+                            "coreProblem": "移动端使用受限",
+                            "keyFeatures": ["登录", "聊天", "知识库"],
+                            "constraints": ["Kotlin", "Compose"],
+                            "summaryPresented": true,
+                            "summaryConfirmed": true,
+                            "missingFields": [],
+                            "readyForSolutions": true
+                        },
+                        "solutions": [
+                            {
+                                "id": "A",
+                                "title": "轻量级双人核心团队",
+                                "architectureSummary": "架构 A",
+                                "teamComposition": ["前端开发者"],
+                                "tokenEstimate": "10k",
+                                "recommendationText": "推荐 A",
+                                "roleRationale": {"前端开发者": "负责实现"},
+                                "omittedRoleRationale": {"QA 测试员": "后续加入"}
+                            },
+                            {
+                                "id": "B",
+                                "title": "标准四人团队",
+                                "architectureSummary": "架构 B",
+                                "teamComposition": ["后端架构师"],
+                                "tokenEstimate": "12k",
+                                "recommendationText": "推荐 B",
+                                "roleRationale": {"后端架构师": "负责接口"},
+                                "omittedRoleRationale": {"增长黑客": "当前不需要"}
+                            },
+                            {
+                                "id": "C",
+                                "title": "完整七人团队",
+                                "architectureSummary": "架构 C",
+                                "teamComposition": ["安全工程师"],
+                                "tokenEstimate": "14k",
+                                "recommendationText": "推荐 C",
+                                "roleRationale": {"安全工程师": "负责安全"},
+                                "omittedRoleRationale": {"DevOps 自动化师": "当前不需要"}
+                            }
+                        ]
+                    })
+                    .to_string();
+                    json!({
+                        "choices": [{
+                            "message": {
+                                "content": format!("你说得对，我绕远了。现在直接重新输出干净版本：\n\n```json\n{decision}\n```")
+                            }
+                        }]
+                    })
+                    .to_string()
+                } else {
+                    valid_three_solutions_chat_body()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.as_bytes().len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
     fn spawn_chat_sse_response_server(requests: Arc<TestMutex<Vec<String>>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("chat sse server should bind");
         let addr = listener
@@ -5342,6 +6638,7 @@ mod tests {
 
     fn base_session() -> AgentSession {
         AgentSession {
+            session_id: "test-session".to_string(),
             provider: "deepseek".to_string(),
             model: "deepseek-v4-flash".to_string(),
             api_key: "test".to_string(),
@@ -5783,22 +7080,116 @@ mod tests {
     }
 
     #[test]
-    fn parser_recovers_json_wrapped_in_markdown_fence() {
+    fn compact_confirmation_variants_count_after_summary_is_presented() {
+        for reply in ["准确。", "确定", "确认准确", "没问题"] {
+            let readiness_without_summary = infer_readiness_from_messages(
+                &[AgentMessage {
+                    role: "user".to_string(),
+                    content: reply.to_string(),
+                    ..Default::default()
+                }],
+                None,
+            );
+            assert!(
+                !readiness_without_summary.summary_confirmed,
+                "{reply} must not self-confirm before the assistant presents a summary"
+            );
+
+            let readiness_with_summary = infer_readiness_from_messages(
+                &[
+                    AgentMessage {
+                        role: "assistant".to_string(),
+                        content:
+                            "目前理解为：产品形态是网站。这样理解对吗？如果准确，我就继续整理三套方案。"
+                                .to_string(),
+                        ..Default::default()
+                    },
+                    AgentMessage {
+                        role: "user".to_string(),
+                        content: reply.to_string(),
+                        ..Default::default()
+                    },
+                ],
+                None,
+            );
+            assert!(
+                readiness_with_summary.summary_confirmed,
+                "{reply} should confirm after the assistant presents a summary"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_confirmation_variants_are_provider_neutral_after_summary_is_presented() {
+        let current = AgentReadiness {
+            product_type: Some("网站".to_string()),
+            target_users: Some("B2B 批发商".to_string()),
+            core_problem: Some("快速上线电商业务".to_string()),
+            key_features: vec!["商品展示".to_string(), "下单支付".to_string()],
+            constraints: vec!["SaaS".to_string(), "快速上线".to_string()],
+            summary_presented: true,
+            summary_confirmed: false,
+            missing_fields: vec!["用户确认".to_string()],
+            ready_for_solutions: false,
+        };
+        let messages = vec![AgentMessage {
+            role: "user".to_string(),
+            content: "确定。".to_string(),
+            ..Default::default()
+        }];
+
+        for provider in ["custom", "deepseek", "openai", "codex"] {
+            let standard = merge_readiness(&current, None, &messages, None, provider);
+            assert!(
+                standard.summary_confirmed,
+                "{provider} should accept compact confirmation after summary is presented"
+            );
+            assert!(standard.ready_for_solutions);
+            assert!(standard.missing_fields.is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_and_deepseek_pro_agent_timeouts_are_extended_without_changing_other_standard_providers(
+    ) {
+        let mut session = base_session();
+
+        for provider in ["openai", "codex"] {
+            session.provider = provider.to_string();
+            assert_eq!(
+                agent_request_timeout(&session),
+                Duration::from_secs(60),
+                "{provider} should keep the existing timeout"
+            );
+        }
+
+        session.provider = "deepseek".to_string();
+        session.model = "deepseek-v4-flash".to_string();
+        assert_eq!(agent_request_timeout(&session), Duration::from_secs(60));
+        session.model = "deepseek-v4-pro".to_string();
+        assert_eq!(agent_request_timeout(&session), Duration::from_secs(180));
+
+        session.provider = "custom".to_string();
+        assert_eq!(agent_request_timeout(&session), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn parser_recovers_question_json_wrapped_in_markdown_fence() {
         let decision = parse_agent_decision_content(
             "```json\n{\"mode\":\"question\",\"assistantMessage\":\"请补充目标用户\",\"readiness\":{\"keyFeatures\":[],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"目标用户\"],\"readyForSolutions\":false}}\n```",
         )
-        .expect("parser should recover fenced json");
+        .expect("question-stage JSON fences should keep the normal chat flow usable");
 
         assert_eq!(decision.mode, "question");
         assert_eq!(decision.assistant_message, "请补充目标用户");
     }
 
     #[test]
-    fn parser_recovers_json_wrapped_as_string() {
+    fn parser_recovers_question_json_wrapped_as_string() {
         let decision = parse_agent_decision_content(
             "\"{\\\"mode\\\":\\\"question\\\",\\\"assistantMessage\\\":\\\"请补充目标用户\\\",\\\"readiness\\\":{\\\"keyFeatures\\\":[],\\\"constraints\\\":[],\\\"summaryPresented\\\":false,\\\"summaryConfirmed\\\":false,\\\"missingFields\\\":[\\\"目标用户\\\"],\\\"readyForSolutions\\\":false}}\"",
         )
-        .expect("parser should recover string-wrapped json");
+        .expect("question-stage string-wrapped JSON should keep the normal chat flow usable");
 
         assert_eq!(decision.mode, "question");
         assert_eq!(decision.assistant_message, "请补充目标用户");
@@ -5809,15 +7200,13 @@ mod tests {
         let decision = parse_agent_decision_content(
             "我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？",
         )
-        .expect("parser should degrade plain text replies into a follow-up question");
+        .expect("plain text follow-up questions should keep the normal chat flow usable");
 
         assert_eq!(decision.mode, "question");
         assert_eq!(
             decision.assistant_message,
             "我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？"
         );
-        assert!(decision.readiness.is_none());
-        assert!(decision.solutions.is_none());
     }
 
     #[test]
@@ -5845,6 +7234,269 @@ mod tests {
         assert!(is_repairable_agent_contract_error(
             "agent_solutions_unstructured_markdown"
         ));
+    }
+
+    #[test]
+    fn parser_rejects_deepseek_markdown_solution_picker_agent_bundle() {
+        let result = parse_agent_decision_content(
+            r#"好的，最终确认完成。现在进入方案设计环节，下面为你生成三个明确的实施方案。
+
+---
+
+## 方案 A：模块化全栈渐进式（推荐）
+
+**架构摘要**：
+- 单 Activity + MVI 架构
+
+**团队组成**（从 agency-agents 中选角）：
+- **后端架构师**：负责对齐后端接口清单与 SSE 流式规范
+- **前端开发者**：负责 Kotlin Compose UI
+
+**Token 预估**：约 10–14万 tokens
+
+**不选的角色与原因**：
+- **QA 测试员**：当前阶段以架构设计+指导文档为主
+
+---
+
+## 方案 B：平台导向分端突击式
+
+**架构摘要**：
+- 以「平台特性」为主线拆分
+
+**团队组成**：
+- **移动应用开发者**：主导所有平台特定能力实现
+- **后端架构师**：负责 SSE 流式协议
+
+**Token 预估**：约 12–16万 tokens
+
+**不选的角色与原因**：
+- **快速原型师**：本方案不以先搭 MVP 验证为目标
+
+---
+
+## 方案 C：接口驱动端到端压路式
+
+**架构摘要**：
+- 严格按 PRD 的子模块顺序拉通
+
+**团队组成**：
+- **后端架构师**：负责 OpenAPI 文档
+- **安全工程师**：负责 Token 存储方案审计
+
+**Token 预估**：约 8–12万 tokens
+
+**不选的角色与原因**：
+- **快速原型师**：本方案以接口契约为驱动
+
+---
+
+<solution-picker-agent
+  instructions="StarDream 复核方案前，请从三种方案中选中推荐方案 A 并居中展示三条关键理由">
+</solution-picker-agent>"#,
+        );
+
+        assert_eq!(result.unwrap_err(), "agent_solutions_unstructured_markdown");
+    }
+
+    #[test]
+    fn parser_rejects_fenced_solutions_json_because_final_selector_requires_raw_json() {
+        let raw = r#"```json
+{
+  "mode": "solutions",
+  "assistantMessage": "已生成三套方案。",
+  "solutions": [
+    {
+      "id": "A",
+      "title": "方案 A",
+      "architectureSummary": "架构 A",
+      "teamComposition": ["产品经理"],
+      "tokenEstimate": "1万 tokens",
+      "recommendationText": "推荐 A",
+      "roleRationale": {"产品经理": "负责范围"},
+      "omittedRoleRationale": {"QA 测试员": "后续再加入"}
+    },
+    {
+      "id": "B",
+      "title": "方案 B",
+      "architectureSummary": "架构 B",
+      "teamComposition": ["前端开发者"],
+      "tokenEstimate": "1万 tokens",
+      "recommendationText": "推荐 B",
+      "roleRationale": {"前端开发者": "负责实现"},
+      "omittedRoleRationale": {"后端架构师": "当前不需要"}
+    },
+    {
+      "id": "C",
+      "title": "方案 C",
+      "architectureSummary": "架构 C",
+      "teamComposition": ["后端架构师"],
+      "tokenEstimate": "1万 tokens",
+      "recommendationText": "推荐 C",
+      "roleRationale": {"后端架构师": "负责接口"},
+      "omittedRoleRationale": {"增长黑客": "当前不需要"}
+    }
+  ]
+}
+```"#;
+
+        let result = parse_agent_decision_content(raw);
+
+        assert_eq!(result.unwrap_err(), "agent_solutions_unstructured_markdown");
+        assert!(is_repairable_agent_contract_error(
+            "agent_solutions_unstructured_markdown"
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_prefaced_fenced_solutions_json_instead_of_plain_text_question() {
+        let raw = r#"啊，我看到了，刚才输出里有冗余。让我直接重新输出干净版本：
+
+```json
+{
+  "mode": "solutions",
+  "assistantMessage": "已生成三套方案。",
+  "solutions": [
+    {
+      "id": "A",
+      "title": "轻量级双人核心团队",
+      "architectureSummary": "架构 A",
+      "teamComposition": ["前端开发者"],
+      "tokenEstimate": "1万 tokens",
+      "recommendationText": "推荐 A",
+      "roleRationale": {"前端开发者": "负责实现"},
+      "omittedRoleRationale": {"QA 测试员": "后续再加入"}
+    },
+    {
+      "id": "B",
+      "title": "标准四人团队",
+      "architectureSummary": "架构 B",
+      "teamComposition": ["后端架构师"],
+      "tokenEstimate": "1万 tokens",
+      "recommendationText": "推荐 B",
+      "roleRationale": {"后端架构师": "负责接口"},
+      "omittedRoleRationale": {"增长黑客": "当前不需要"}
+    },
+    {
+      "id": "C",
+      "title": "完整七人团队",
+      "architectureSummary": "架构 C",
+      "teamComposition": ["安全工程师"],
+      "tokenEstimate": "1万 tokens",
+      "recommendationText": "推荐 C",
+      "roleRationale": {"安全工程师": "负责安全"},
+      "omittedRoleRationale": {"DevOps 自动化师": "当前不需要"}
+    }
+  ]
+}
+```"#;
+
+        let result = parse_agent_decision_content(raw);
+
+        assert_eq!(result.unwrap_err(), "agent_solutions_unstructured_markdown");
+    }
+
+    #[test]
+    fn parser_accepts_raw_json_three_real_solutions_and_requests_selector() {
+        let raw = r#"{
+  "mode": "solutions",
+  "assistantMessage": "已根据你的确认生成三套可选实施方案。",
+  "understandingSummary": "你要为 B2B 批发电商网站生成初始化协作包，目标用户是浴室浴霸行业中小批发商、经销商和工程采购商。",
+  "readiness": {
+    "productType": "网站",
+    "targetUsers": "浴室浴霸行业中小批发商、经销商、工程采购商",
+    "coreProblem": "快速搭建可下单、可运营、可交给 Codex 接手实施的 B2B 批发电商网站",
+    "keyFeatures": ["商品展示", "下单支付", "搜索过滤", "优惠券系统", "后台管理"],
+    "constraints": ["SaaS", "快速上线", "Codex 接手实施"],
+    "summaryPresented": true,
+    "summaryConfirmed": true,
+    "missingFields": [],
+    "readyForSolutions": true
+  },
+  "solutions": [
+    {
+      "id": "A",
+      "title": "模块化全栈渐进式",
+      "architectureSummary": "先以商品、订单、支付、后台管理四个模块拉通 MVP，再逐步补齐营销和搜索能力。",
+      "teamComposition": ["产品经理", "前端开发者", "后端架构师", "UX 架构师"],
+      "tokenEstimate": "10-14万 tokens",
+      "recommendationText": "推荐用于快速上线并保持后续可扩展。",
+      "roleRationale": {
+        "产品经理": "负责范围收敛、用户故事和验收标准。",
+        "前端开发者": "负责商品、购物车、订单和后台 UI 实现。",
+        "后端架构师": "负责订单、支付、用户和商品接口边界。",
+        "UX 架构师": "负责批发采购路径和后台信息架构。"
+      },
+      "omittedRoleRationale": {
+        "QA 测试员": "当前是初始化协作包规划阶段，自动验收策略先由后续 Sprint 承接。"
+      }
+    },
+    {
+      "id": "B",
+      "title": "营销运营优先式",
+      "architectureSummary": "优先搭建商品内容、优惠券、直播带货入口和运营后台，再补齐高级采购流程。",
+      "teamComposition": ["产品经理", "前端开发者", "增长黑客", "内容策略师"],
+      "tokenEstimate": "12-16万 tokens",
+      "recommendationText": "适合先验证获客和转化，再扩大交易能力。",
+      "roleRationale": {
+        "产品经理": "负责确定营销优先级和转化目标。",
+        "前端开发者": "负责运营页面、活动组件和后台配置。",
+        "增长黑客": "负责优惠券、直播入口和转化路径假设。",
+        "内容策略师": "负责商品卖点和行业内容结构。"
+      },
+      "omittedRoleRationale": {
+        "安全工程师": "本阶段不处理复杂风控，支付安全在后续接口实现阶段专项处理。"
+      }
+    },
+    {
+      "id": "C",
+      "title": "接口契约驱动式",
+      "architectureSummary": "先定义商品、订单、支付、用户和后台管理 API 契约，再按契约生成前后端实施包。",
+      "teamComposition": ["产品经理", "后端架构师", "前端开发者", "安全工程师"],
+      "tokenEstimate": "8-12万 tokens",
+      "recommendationText": "适合后端边界明确、希望 Codex 按接口稳定推进的场景。",
+      "roleRationale": {
+        "产品经理": "负责按接口拆分里程碑和验收脚本。",
+        "后端架构师": "负责 OpenAPI 契约、数据模型和服务边界。",
+        "前端开发者": "负责根据接口契约实现页面和状态流。",
+        "安全工程师": "负责支付、鉴权和日志脱敏约束。"
+      },
+      "omittedRoleRationale": {
+        "快速原型师": "本方案以接口稳定性为主，不以快速 POC 为主。"
+      }
+    }
+  ]
+}"#;
+
+        let decision = parse_agent_decision_content(raw)
+            .expect("raw JSON with three complete solutions should pass strict parsing");
+
+        assert_eq!(decision.mode, "solutions");
+        assert_eq!(
+            decision.solutions.as_ref().map(Vec::len),
+            Some(3),
+            "strict parser must preserve all three solution items"
+        );
+
+        let mut session = base_session();
+        session.messages.push(AgentMessage {
+            role: "assistant".to_string(),
+            content: "目前理解为：产品形态是网站；目标用户是浴室浴霸行业批发商；核心问题是快速搭建 B2B 批发电商网站；关键功能包括商品展示、下单支付和后台管理；约束条件是 SaaS、快速上线、Codex 接手实施。这样理解对吗？如果准确，我就继续整理三套方案。".to_string(),
+            ..Default::default()
+        });
+        session.messages.push(AgentMessage {
+            role: "user".to_string(),
+            content: "准确。".to_string(),
+            ..Default::default()
+        });
+
+        apply_agent_decision(&mut session, decision)
+            .expect("valid three-solution decision should apply");
+
+        assert_eq!(session.solutions.len(), 3);
+        assert!(session.tool_calls.iter().any(|tool_call| {
+            tool_call.tool_name == "open_solution_selector" && tool_call.status == "requested"
+        }));
     }
 
     #[test]
@@ -6019,18 +7671,77 @@ mod tests {
     fn semantic_review_reuses_chat_fallback_when_responses_endpoint_is_unavailable() {
         let base_url = spawn_semantic_fallback_server();
         let mut session = base_session();
+        let session_id = "semantic-call-log-session".to_string();
+        let workspace = repo_root()
+            .join("tmp")
+            .join("desktop-main-flow")
+            .join(format!(
+                "semantic-call-log-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+        let runtime_root = repo_root()
+            .join("tmp")
+            .join("desktop-main-flow")
+            .join(format!(
+                "commonhe-runtime-log-root-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime_root).unwrap();
+        session.session_id = session_id.clone();
+        session.provider = "codex".to_string();
+        session.model = "gpt-5.5".to_string();
         session.base_url = base_url;
         session.wire_api = "responses".to_string();
-        session.api_key = "test-api-key".to_string();
+        session.api_key = "sk-test".to_string();
+        session.workspace_path = workspace.to_string_lossy().to_string();
 
-        let value = request_semantic_json(&session, "只返回 JSON。", &json!({ "round": 1 }))
-            .expect("semantic review should fall back to chat completions");
+        let value = with_commonhe_runtime_root(&runtime_root, || {
+            request_semantic_json(&session, "只返回 JSON。", &json!({ "round": 1 }))
+                .expect("semantic review should fall back to chat completions")
+        });
 
         assert_eq!(value.get("passed").and_then(Value::as_bool), Some(true));
         assert_eq!(
             value.get("reviewerAgent").and_then(Value::as_str),
             Some("星梦梦")
         );
+        let target_call_log_path = workspace
+            .join("data")
+            .join("logs")
+            .join("commonhe-agent-calls.jsonl");
+        assert!(
+            !target_call_log_path.exists(),
+            "model-call log should stay in the launcher runtime root, not target workspace data/logs: {}",
+            target_call_log_path.display()
+        );
+        let call_log_path = runtime_root
+            .join("data")
+            .join("logs")
+            .join("commonhe-agent-calls.jsonl");
+        let call_log = fs::read_to_string(&call_log_path).expect("semantic calls should be logged");
+        let relevant_lines = call_log
+            .lines()
+            .filter(|line| line.contains(&format!("\"sessionId\":\"{session_id}\"")))
+            .collect::<Vec<_>>();
+        let call_log = relevant_lines.join("\n");
+        assert!(
+            call_log.contains("\"attempt\":\"semantic.responses.primary\""),
+            "{call_log}"
+        );
+        assert!(
+            call_log.contains("\"attempt\":\"semantic.chat.primary\""),
+            "{call_log}"
+        );
+        assert!(call_log.contains("\"workspacePath\""), "{call_log}");
+        assert!(
+            call_log.contains("\"operation\":\"semantic\""),
+            "{call_log}"
+        );
+        assert!(call_log.contains("\"responseStatus\":404"), "{call_log}");
+        assert!(call_log.contains("\"responseStatus\":200"), "{call_log}");
     }
 
     #[test]
@@ -6052,6 +7763,216 @@ mod tests {
         assert_eq!(
             value.get("reviewerAgent").and_then(Value::as_str),
             Some("星梦梦")
+        );
+    }
+
+    #[test]
+    fn agent_decision_parser_accepts_minimax_think_wrapped_json() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n这里会推理 JSON schema，比如 {\"mode\":\"question|solutions\"}，但这不是最终输出。\n</think>\n{\"mode\":\"question\",\"assistantMessage\":\"我先确认电商订单系统的目标用户和核心流程。\",\"understandingSummary\":\"电商订单管理系统\",\"readiness\":{\"productType\":\"软件\",\"targetUsers\":\"电商运营人员\",\"coreProblem\":\"订单处理分散\",\"keyFeatures\":[\"订单管理\"],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"约束条件\",\"用户确认\"],\"readyForSolutions\":false}}"
+                    }
+                }
+            ]
+        });
+
+        let decision = parse_agent_decision_response_for_provider(&response, "custom")
+            .expect("Custom MiniMax think-wrapped chat responses should parse final JSON");
+
+        assert_eq!(decision.mode, "question");
+        assert_eq!(
+            decision.assistant_message,
+            "我先确认电商订单系统的目标用户和核心流程。"
+        );
+    }
+
+    #[test]
+    fn custom_minimax_think_wrapped_plain_text_question_keeps_normal_chat_usable() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n先判断还缺目标用户。\n</think>\n我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？"
+                    }
+                }
+            ]
+        });
+
+        let decision = parse_agent_decision_response_for_provider(&response, "custom")
+            .expect("custom MiniMax plain-text follow-up after think should stay as question");
+
+        assert_eq!(decision.mode, "question");
+        assert_eq!(
+            decision.assistant_message,
+            "我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？"
+        );
+    }
+
+    #[test]
+    fn agent_decision_parser_does_not_apply_minimax_cleanup_to_standard_providers() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n这里会推理 JSON schema，比如 {\"mode\":\"question|solutions\"}，但这不是最终输出。\n</think>\n{\"mode\":\"question\",\"assistantMessage\":\"不应被标准渠道解析\",\"readiness\":{\"keyFeatures\":[],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"目标用户\"],\"readyForSolutions\":false}}"
+                    }
+                }
+            ]
+        });
+
+        for provider in ["deepseek", "codex", "openai"] {
+            let error = parse_agent_decision_response_for_provider(&response, provider)
+                .expect_err("standard providers should keep rejecting this MiniMax-only wrapper");
+            assert_eq!(
+                error, "agent_response_not_json",
+                "{provider} should not strip MiniMax reasoning tags and parse the later JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_decision_parser_preserves_think_text_inside_valid_json_string() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"mode\":\"question\",\"assistantMessage\":\"请保留 <think>示例</think> 文本。\",\"understandingSummary\":\"标签示例\",\"readiness\":{\"productType\":\"软件\",\"targetUsers\":\"测试用户\",\"coreProblem\":\"验证解析边界\",\"keyFeatures\":[\"解析\"],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"约束条件\",\"用户确认\"],\"readyForSolutions\":false}}"
+                    }
+                }
+            ]
+        });
+
+        let decision = parse_agent_decision_response(&response)
+            .expect("valid JSON strings should parse before reasoning cleanup is attempted");
+
+        assert_eq!(
+            decision.assistant_message,
+            "请保留 <think>示例</think> 文本。"
+        );
+    }
+
+    #[test]
+    fn semantic_json_extractor_accepts_minimax_think_wrapped_json_object() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n星梦梦先检查 schema 形态：{\"passed\":\"boolean\"}。\n</think>\n```json\n{\"passed\":true,\"reviewerAgent\":\"星梦梦\",\"blockingIssues\":[],\"questionsForMengXingxing\":[],\"requiredRepairs\":[],\"reviewSummary\":\"通过\",\"confidence\":\"high\"}\n```"
+                    }
+                }
+            ]
+        });
+
+        let value = extract_json_value_from_model_response_for_provider(&response, "custom")
+            .expect("custom semantic JSON extractor should tolerate MiniMax think tags");
+
+        assert_eq!(value.get("passed").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            value.get("reviewerAgent").and_then(Value::as_str),
+            Some("星梦梦")
+        );
+    }
+
+    #[test]
+    fn semantic_json_extractor_does_not_apply_minimax_cleanup_to_standard_providers() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n星梦梦先检查 schema 形态：{\"passed\":\"boolean\"}。\n</think>\n```json\n{\"passed\":true,\"reviewerAgent\":\"星梦梦\",\"blockingIssues\":[],\"questionsForMengXingxing\":[],\"requiredRepairs\":[],\"reviewSummary\":\"通过\",\"confidence\":\"high\"}\n```"
+                    }
+                }
+            ]
+        });
+
+        for provider in ["deepseek", "codex", "openai"] {
+            let value = extract_json_value_from_model_response_for_provider(&response, provider)
+                .expect("standard providers should use existing embedded-object extraction");
+            assert_ne!(
+                value.get("passed").and_then(Value::as_bool),
+                Some(true),
+                "{provider} should not strip MiniMax reasoning tags and parse the later JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_json_extractor_preserves_think_text_inside_valid_json_string() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"passed\":true,\"reviewerAgent\":\"星梦梦\",\"blockingIssues\":[],\"questionsForMengXingxing\":[],\"requiredRepairs\":[],\"reviewSummary\":\"保留 <think>示例</think> 文本。\",\"confidence\":\"high\"}"
+                    }
+                }
+            ]
+        });
+
+        let value = extract_json_value_from_model_response(&response)
+            .expect("valid semantic JSON should parse before reasoning cleanup is attempted");
+
+        assert_eq!(
+            value.get("reviewSummary").and_then(Value::as_str),
+            Some("保留 <think>示例</think> 文本。")
+        );
+    }
+
+    #[test]
+    fn custom_minimax_think_wrapped_malformed_json_is_rejected() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n这里是 MiniMax 推理过程。\n</think>\n{\"mode\":\"question\",\"assistantMessage\":"
+                    }
+                }
+            ]
+        });
+
+        let error = parse_agent_decision_response_for_provider(&response, "custom")
+            .expect_err("malformed JSON after MiniMax reasoning must not be treated as valid");
+
+        assert_eq!(error, "agent_response_not_json");
+    }
+
+    #[test]
+    fn custom_minimax_top_level_think_json_example_does_not_mask_malformed_final_json() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n示例对象不能被当成最终答案：{\"mode\":\"question\",\"assistantMessage\":\"错误来源\",\"readiness\":{\"keyFeatures\":[],\"constraints\":[],\"summaryPresented\":false,\"summaryConfirmed\":false,\"missingFields\":[\"目标用户\"],\"readyForSolutions\":false}}\n</think>\n{\"mode\":\"question\",\"assistantMessage\":"
+                    }
+                }
+            ]
+        });
+
+        let error = parse_agent_decision_response_for_provider(&response, "custom").expect_err(
+            "custom MiniMax parsing must reject malformed final JSON after top-level think",
+        );
+
+        assert_eq!(error, "agent_response_not_json");
+    }
+
+    #[test]
+    fn custom_minimax_semantic_top_level_think_json_example_does_not_mask_malformed_final_json() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\n示例对象不能被当成星梦梦最终验收：{\"passed\":true,\"reviewerAgent\":\"星梦梦\",\"blockingIssues\":[],\"questionsForMengXingxing\":[],\"requiredRepairs\":[],\"reviewSummary\":\"错误来源\",\"confidence\":\"high\"}\n</think>\n{\"passed\":"
+                    }
+                }
+            ]
+        });
+
+        let value = extract_json_value_from_model_response_for_provider(&response, "custom");
+
+        assert!(
+            value.is_none(),
+            "custom semantic extraction must not parse JSON examples inside top-level MiniMax think blocks"
         );
     }
 
@@ -6169,6 +8090,39 @@ mod tests {
         );
         assert!(message.contains("bodySnippet=data:"), "{message}");
         assert!(!message.contains("test-api-key-secret123456"), "{message}");
+    }
+
+    #[test]
+    fn body_read_timeout_is_not_reported_as_empty_json_body() {
+        let base_url = spawn_headers_then_delayed_body_server();
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(100))
+            .build()
+            .expect("test client should build");
+        let endpoint = format!("{base_url}/chat/completions");
+
+        let error = post_agent_json(
+            &client,
+            &endpoint,
+            "sk-secret123456",
+            &json!({ "model": "deepseek-v4-pro" }),
+            None,
+        )
+        .expect_err("delayed response body should fail body reading");
+
+        assert_eq!(error.status_code, 200);
+        assert!(
+            error.body.contains("response_body_read_failed"),
+            "{}",
+            error.body
+        );
+        assert!(
+            !error.body.contains("invalid_json reason=empty_body"),
+            "{}",
+            error.body
+        );
+        assert!(!error.body.contains("sk-secret123456"), "{}", error.body);
     }
 
     #[test]
@@ -6328,7 +8282,7 @@ base_url = "https://ai.xingmengmeng.com/v1"
         session.provider = "deepseek".to_string();
         session.model = "deepseek-v4-flash".to_string();
         session.base_url = base_url;
-        session.api_key = "test-api-key".to_string();
+        session.api_key = "sk-test".to_string();
         session.wire_api = "chat_completions".to_string();
 
         let decision = request_agent_decision(&session, Some("user_message"))
@@ -6343,6 +8297,73 @@ base_url = "https://ai.xingmengmeng.com/v1"
     }
 
     #[test]
+    fn deepseek_agent_session_retries_minimal_when_primary_and_compat_bodies_are_empty() {
+        let requests = Arc::new(TestMutex::new(Vec::new()));
+        let base_url = spawn_chat_two_empty_bodies_then_success_server(requests.clone());
+        let mut session = base_session();
+        session.provider = "deepseek".to_string();
+        session.model = "deepseek-v4-pro".to_string();
+        session.base_url = base_url;
+        session.api_key = "sk-test".to_string();
+        session.wire_api = "chat_completions".to_string();
+        session.messages = vec![build_agent_message("user", "我要做学生管理系统")];
+
+        let decision = request_agent_decision(&session, Some("user_message"))
+            .expect("DeepSeek empty primary and compat bodies should retry minimal body");
+
+        assert_eq!(decision.mode, "question");
+        assert_eq!(decision.assistant_message, "连续空响应后已恢复。");
+        let captured = requests.lock().expect("request capture should be readable");
+        assert_eq!(captured.len(), 3);
+        assert!(
+            captured[0].contains("\"response_format\""),
+            "{}",
+            captured[0]
+        );
+        assert!(
+            !captured[1].contains("\"response_format\""),
+            "{}",
+            captured[1]
+        );
+        assert!(captured[2].contains("You are 梦星星"), "{}", captured[2]);
+    }
+
+    #[test]
+    fn plain_text_question_response_falls_back_without_contract_repair() {
+        let requests = Arc::new(TestMutex::new(Vec::new()));
+        let base_url = spawn_chat_plain_text_until_repair_success_server(requests.clone());
+        let mut session = base_session();
+        session.provider = "deepseek".to_string();
+        session.model = "deepseek-v4-flash".to_string();
+        session.base_url = base_url;
+        session.api_key = "sk-test".to_string();
+        session.wire_api = "chat_completions".to_string();
+
+        let decision = request_agent_decision_with_contract_repair(&session, Some("user_message"))
+            .expect(
+                "plain-text question should stay usable without forcing solution-stage JSON repair",
+            );
+
+        assert_eq!(decision.mode, "question");
+        assert_eq!(
+            decision.assistant_message,
+            "我先确认一下：这个网站主要给社团负责人用，还是也给普通成员使用？"
+        );
+        let captured = requests.lock().expect("request capture should be readable");
+        assert_eq!(
+            captured.len(),
+            1,
+            "normal question-stage chat should not be forced through contract repair"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|request| !request.contains("contract_repair")),
+            "repair requests should be reserved for final structured solution failures"
+        );
+    }
+
+    #[test]
     fn deepseek_agent_session_parses_sse_response_and_requests_non_streaming() {
         let requests = Arc::new(TestMutex::new(Vec::new()));
         let base_url = spawn_chat_sse_response_server(requests.clone());
@@ -6350,7 +8371,7 @@ base_url = "https://ai.xingmengmeng.com/v1"
         session.provider = "deepseek".to_string();
         session.model = "deepseek-v4-flash".to_string();
         session.base_url = base_url;
-        session.api_key = "test-api-key".to_string();
+        session.api_key = "sk-test".to_string();
         session.wire_api = "chat_completions".to_string();
 
         let decision = request_agent_decision(&session, Some("user_message"))
@@ -6360,6 +8381,129 @@ base_url = "https://ai.xingmengmeng.com/v1"
         assert_eq!(decision.assistant_message, "继续确认双端范围");
         let captured = requests.lock().expect("request capture should be readable");
         assert!(captured[0].contains("\"stream\":false"), "{}", captured[0]);
+    }
+
+    #[test]
+    fn parser_continues_to_later_plain_text_candidate_after_invalid_json_fragment() {
+        let decision = parse_agent_decision_response(&json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            "{\"mode\":\"question\",\"assistantMessage\":",
+                            "完美，信息已经很充分了。让我总结确认，然后给出方案。"
+                        ]
+                    }
+                }
+            ]
+        }))
+        .expect("invalid text fragments should not hide a usable plain-text assistant reply");
+
+        assert_eq!(decision.mode, "question");
+        assert_eq!(
+            decision.assistant_message,
+            "完美，信息已经很充分了。让我总结确认，然后给出方案。"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_pro_confirmed_summary_is_retried_as_solutions() {
+        let requests = Arc::new(TestMutex::new(Vec::new()));
+        let base_url = spawn_confirmed_summary_then_solutions_server(requests.clone());
+        let mut session = base_session();
+        session.provider = "deepseek".to_string();
+        session.model = "deepseek-v4-pro".to_string();
+        session.base_url = base_url;
+        session.api_key = "sk-test".to_string();
+        session.wire_api = "chat_completions".to_string();
+        session.readiness = AgentReadiness {
+            product_type: Some("MCP".to_string()),
+            target_users: Some("企业员工".to_string()),
+            core_problem: Some("移动端使用受限".to_string()),
+            key_features: vec!["登录".to_string(), "聊天".to_string(), "知识库".to_string()],
+            constraints: vec!["Android 8+".to_string()],
+            summary_presented: true,
+            summary_confirmed: false,
+            missing_fields: vec!["用户确认".to_string()],
+            ready_for_solutions: false,
+        };
+        session.messages.push(AgentMessage {
+            role: "assistant".to_string(),
+            content: "目前理解为：产品形态是 MCP；目标用户是企业员工；这样理解对吗？".to_string(),
+            ..Default::default()
+        });
+        session.messages.push(AgentMessage {
+            role: "user".to_string(),
+            content: "确认".to_string(),
+            ..Default::default()
+        });
+        session.readiness = merge_readiness(
+            &session.readiness,
+            None,
+            &session.messages,
+            None,
+            "deepseek",
+        );
+
+        let decision = request_agent_decision_with_contract_repair(&session, Some("user_message"))
+            .expect("DeepSeek v4-pro summary-after-confirmation should be forced into solutions");
+
+        assert_eq!(decision.mode, "solutions");
+        assert_eq!(decision.solutions.as_ref().map(Vec::len), Some(3));
+        let captured = requests.lock().expect("request capture should be readable");
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].contains("deepseek-v4-pro"));
+        assert!(
+            captured[1].contains("contract_repair_confirmed_solutions"),
+            "{}",
+            captured[1]
+        );
+    }
+
+    #[test]
+    fn deepseek_flash_prefaced_fenced_solutions_are_repaired_to_raw_solutions() {
+        let requests = Arc::new(TestMutex::new(Vec::new()));
+        let base_url = spawn_prefaced_fenced_solutions_then_raw_solutions_server(requests.clone());
+        let mut session = base_session();
+        session.provider = "deepseek".to_string();
+        session.model = "deepseek-v4-flash".to_string();
+        session.base_url = base_url;
+        session.api_key = "sk-test".to_string();
+        session.wire_api = "chat_completions".to_string();
+        session.readiness = AgentReadiness {
+            product_type: Some("Android App".to_string()),
+            target_users: Some("企业员工".to_string()),
+            core_problem: Some("移动端使用受限".to_string()),
+            key_features: vec!["登录".to_string(), "聊天".to_string(), "知识库".to_string()],
+            constraints: vec!["Kotlin".to_string(), "Compose".to_string()],
+            summary_presented: true,
+            summary_confirmed: true,
+            missing_fields: vec![],
+            ready_for_solutions: true,
+        };
+        session.messages.push(AgentMessage {
+            role: "assistant".to_string(),
+            content: "目前理解为：Android App，面向企业员工。这样理解对吗？".to_string(),
+            ..Default::default()
+        });
+        session.messages.push(AgentMessage {
+            role: "user".to_string(),
+            content: "没有，为什么你会问这个？我们不是在聊项目吗？".to_string(),
+            ..Default::default()
+        });
+
+        let decision = request_agent_decision_with_contract_repair(&session, Some("user_message"))
+            .expect("prefaced fenced solutions should trigger contract repair, not plain chat");
+
+        assert_eq!(decision.mode, "solutions");
+        assert_eq!(decision.solutions.as_ref().map(Vec::len), Some(3));
+        let captured = requests.lock().expect("request capture should be readable");
+        assert_eq!(captured.len(), 2);
+        assert!(
+            captured[1].contains("contract_repair_unstructured_solutions"),
+            "{}",
+            captured[1]
+        );
     }
 
     #[test]
@@ -6502,6 +8646,159 @@ base_url = "{base_url}"
     }
 
     #[test]
+    fn send_message_writes_runtime_diagnostic_when_agent_response_is_invalid() {
+        let store = AgentStore::new();
+        let session_id = "session-runtime-diagnostic".to_string();
+        let workspace = repo_root()
+            .join("tmp")
+            .join("desktop-main-flow")
+            .join(format!(
+                "agent-runtime-diagnostic-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+        fs::create_dir_all(&workspace).unwrap();
+        let requests = Arc::new(TestMutex::new(Vec::new()));
+        let base_url = spawn_chat_always_empty_body_server(requests.clone());
+        let mut session = base_session();
+        session.base_url = base_url;
+        session.api_key = "sk-secret123456".to_string();
+        session.workspace_path = workspace.to_string_lossy().to_string();
+        session.messages = vec![build_agent_message("assistant", "请确认当前理解是否准确。")];
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), session);
+
+        let result = store.send_message(AgentSendRequest {
+            session_id: session_id.clone(),
+            message: "是的".to_string(),
+        });
+
+        let error = result.expect_err("empty 200 responses should fail");
+        assert!(error.contains("agent_response_invalid"), "{error}");
+        let diagnostic_path = workspace
+            .join(".commonhe")
+            .join("session")
+            .join(&session_id)
+            .join("runtime-diagnostics.jsonl");
+        let diagnostic =
+            fs::read_to_string(&diagnostic_path).expect("runtime diagnostic should be written");
+        assert!(
+            diagnostic.contains("\"operation\":\"message\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("\"provider\":\"deepseek\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("\"model\":\"deepseek-v4-flash\""),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("agent_response_invalid"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("reason=empty_body"), "{diagnostic}");
+        assert!(!diagnostic.contains("sk-secret123456"), "{diagnostic}");
+    }
+
+    #[test]
+    fn send_message_writes_agent_call_log_for_each_http_attempt() {
+        let store = AgentStore::new();
+        let session_id = "session-agent-call-log".to_string();
+        let workspace = repo_root()
+            .join("tmp")
+            .join("desktop-main-flow")
+            .join(format!(
+                "agent-call-log-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+        let runtime_root = repo_root()
+            .join("tmp")
+            .join("desktop-main-flow")
+            .join(format!(
+                "commonhe-runtime-log-root-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&runtime_root).unwrap();
+        let requests = Arc::new(TestMutex::new(Vec::new()));
+        let base_url = spawn_chat_two_empty_bodies_then_success_server(requests.clone());
+        let mut session = base_session();
+        session.session_id = session_id.clone();
+        session.base_url = base_url;
+        session.api_key = "sk-secret123456".to_string();
+        session.workspace_path = workspace.to_string_lossy().to_string();
+        session.messages = vec![build_agent_message("assistant", "请确认当前理解是否准确。")];
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), session);
+
+        let result = with_commonhe_runtime_root(&runtime_root, || {
+            store
+                .send_message(AgentSendRequest {
+                    session_id: session_id.clone(),
+                    message: "是的".to_string(),
+                })
+                .expect("minimal retry should recover")
+        });
+
+        assert_eq!(
+            result.messages.last().unwrap().content,
+            "连续空响应后已恢复。"
+        );
+        let target_call_log_path = workspace
+            .join("data")
+            .join("logs")
+            .join("commonhe-agent-calls.jsonl");
+        assert!(
+            !target_call_log_path.exists(),
+            "model-call log should stay in the launcher runtime root, not target workspace data/logs: {}",
+            target_call_log_path.display()
+        );
+        let call_log_path = runtime_root
+            .join("data")
+            .join("logs")
+            .join("commonhe-agent-calls.jsonl");
+        let call_log =
+            fs::read_to_string(&call_log_path).expect("agent call log should be written");
+        let lines = call_log
+            .lines()
+            .filter(|line| line.contains(&format!("\"sessionId\":\"{session_id}\"")))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{call_log}");
+        assert!(
+            lines[0].contains("\"attempt\":\"agent.chat.primary\""),
+            "{call_log}"
+        );
+        assert!(
+            lines[1].contains("\"attempt\":\"agent.chat.compat\""),
+            "{call_log}"
+        );
+        assert!(
+            lines[2].contains("\"attempt\":\"agent.chat.minimal\""),
+            "{call_log}"
+        );
+        assert!(call_log.contains("\"operation\":\"message\""), "{call_log}");
+        assert!(call_log.contains("\"workspacePath\""), "{call_log}");
+        assert!(call_log.contains("\"requestBody\""), "{call_log}");
+        assert!(call_log.contains("\"responseStructure\""), "{call_log}");
+        assert!(
+            call_log.contains("\"parseError\":\"empty_body\""),
+            "{call_log}"
+        );
+        assert!(call_log.contains("\"textCandidateCount\":1"), "{call_log}");
+        assert!(!call_log.contains("sk-secret123456"), "{call_log}");
+    }
+
+    #[test]
     fn meng_xingxing_solutions_missing_role_rationale_are_rejected() {
         let raw = r#"
 {
@@ -6595,6 +8892,43 @@ base_url = "{base_url}"
         assert!(prompt.contains("Do not ask the user to repeat anything"));
         assert!(prompt.contains("roleRationale"));
         assert!(prompt.contains("omittedRoleRationale"));
+    }
+
+    #[test]
+    fn agent_prompt_forbids_markdown_solution_bundles_and_fake_tool_tags() {
+        let session = base_session();
+        let prompt = build_agent_context_prompt(&session, Some("session_start"));
+
+        assert!(prompt.contains("Do not include Markdown"));
+        assert!(prompt.contains("<solution-picker-agent>"));
+        assert!(prompt.contains("pseudo tool calls"));
+        assert!(prompt.contains("desktop program opens the solution selector"));
+        assert!(prompt.contains("solutions[]"));
+    }
+
+    #[test]
+    fn unstructured_solution_repair_prompt_requires_json_retry_not_chat_selection() {
+        let session = base_session();
+        let prompt =
+            build_agent_context_prompt(&session, Some("contract_repair_unstructured_solutions"));
+
+        assert!(prompt.contains("described 方案A/方案B/方案C in Markdown"));
+        assert!(prompt.contains("JSON only"));
+        assert!(prompt.contains("Do not ask the user to choose in chat"));
+        assert!(prompt.contains("Do not output <solution-picker-agent>"));
+        assert!(prompt.contains("desktop program opens the solution selector"));
+    }
+
+    #[test]
+    fn generic_contract_repair_prompt_uses_raw_json_only_acceptance_criteria() {
+        let session = base_session();
+        let prompt = build_agent_context_prompt(&session, Some("contract_repair"));
+
+        assert!(prompt.contains("Return exactly one complete, valid JSON object and nothing else"));
+        assert!(prompt.contains("Output must be raw JSON only"));
+        assert!(prompt.contains("Minimum acceptance criteria"));
+        assert!(prompt.contains("The response parses as JSON without errors"));
+        assert!(prompt.contains("Do not omit mode or solutions[]"));
     }
 
     #[test]
@@ -8275,6 +10609,105 @@ if ($Stage -eq 'confirm') {
     }
 
     #[test]
+    fn normalize_rationale_repairs_real_deepseek_low_code_semantic_loop_shape() {
+        let mut solution = AgentSolution {
+            id: "B".to_string(),
+            title: "跨端框架 + 轻量后端均衡方案".to_string(),
+            architecture_summary: "低代码后台 + uni-app 小程序 + Web 双端。".to_string(),
+            team_composition: vec![
+                "architect".to_string(),
+                "backend".to_string(),
+                "compliance".to_string(),
+                "database".to_string(),
+                "docs".to_string(),
+                "frontend".to_string(),
+                "miniapp".to_string(),
+                "qa".to_string(),
+                "reviewer".to_string(),
+            ],
+            token_estimate: "初始化协作包 LLM 预算约 10 万 token：需求/方案梳理约 2 万，角色职责与边界定义约 1.5 万，星梦梦语义验收与修复约 2.5 万，目标软件协作包交接文档（含 AGENTS.md 和 .codex/ 模板）约 4 万；不包含业务代码生成或业务实现验收。".to_string(),
+            recommendation_text: "推荐给需要双端体验一致、未来有扩展需求、不想被单一平台绑定的团队。".to_string(),
+            role_rationale: HashMap::from([
+                (
+                    "architect".to_string(),
+                    "负责低代码平台选型、平台边界、扩展点、权限/数据边界和后续退出方案，把梦星星方案沉淀为可执行实施边界。；承接 产品经理 的并入职责".to_string(),
+                ),
+                (
+                    "backend".to_string(),
+                    "负责低代码平台 API 集成、权限/业务规则配置、外部服务适配和必要的定制扩展边界。".to_string(),
+                ),
+                (
+                    "compliance".to_string(),
+                    "负责安全、合规、权限和敏感数据处理边界。".to_string(),
+                ),
+                (
+                    "database".to_string(),
+                    "负责低代码平台数据模型、字段关系、状态一致性、迁移策略、报表查询和关键统计边界。".to_string(),
+                ),
+                (
+                    "docs".to_string(),
+                    "维护初始化协作包真源、接手文档和后续实施入口；将在 bootstrap 阶段为目标软件（Codex）生成 AGENTS.md 和 .codex/ 入口文件，并记录交接路径。".to_string(),
+                ),
+                (
+                    "frontend".to_string(),
+                    "负责低代码平台管理后台页面配置、组件定制、表单/报表可见路径和 UI 一致性；不承接微信小程序端。".to_string(),
+                ),
+                (
+                    "miniapp".to_string(),
+                    "负责微信小程序端学生/家长查询入口、端侧状态、跨端交互和与低代码平台 API 的适配。".to_string(),
+                ),
+                (
+                    "qa".to_string(),
+                    "负责可执行测试计划、关键路径验证、技术回归、跨端一致性和缺陷证据；不替代 reviewer 的语义/范围复核。".to_string(),
+                ),
+                (
+                    "reviewer".to_string(),
+                    "负责语义复核、角色取舍、方案范围漂移和最终语义验收证据；不承接测试执行或跨端验证。".to_string(),
+                ),
+            ]),
+            omitted_role_rationale: HashMap::from([
+                (
+                    "UI 设计师".to_string(),
+                    "UI 设计职责并入 frontend 角色，由 frontend 负责低代码平台管理后台组件配置、视觉一致性和基础交互。".to_string(),
+                ),
+                (
+                    "产品经理".to_string(),
+                    "产品经理职责完全由 architect 角色承接，包括需求梳理、范围定义和产品决策；当前目标软件协作包不生成独立产品经理 Agent，后续迭代中 reviewer 在验收时复核范围漂移。".to_string(),
+                ),
+            ]),
+        };
+
+        normalize_repaired_solution_rationale(&mut solution);
+
+        let architect = solution.role_rationale.get("architect").unwrap();
+        assert!(!architect.contains("。；"));
+        assert!(!architect.contains("承接 产品经理 的并入职责"));
+        assert!(architect.contains("需求梳理"));
+        assert!(architect.contains("用户故事优先级"));
+        assert!(architect.contains("MVP 范围把控"));
+
+        let docs = solution.role_rationale.get("docs").unwrap();
+        assert!(docs.contains("当前负责维护初始化协作包真源"));
+        assert!(docs.contains("实际落盘由启动器"));
+        assert!(docs.contains("docs 负责记录交接说明"));
+        assert!(!docs.contains("将在 bootstrap 阶段为目标软件"));
+
+        let ui_omission = solution.omitted_role_rationale.get("UI 设计师").unwrap();
+        assert!(ui_omission.contains("frontend"));
+        assert!(ui_omission.contains("miniapp"));
+        assert!(ui_omission.contains("小程序端"));
+
+        let reviewer = solution.role_rationale.get("reviewer").unwrap();
+        assert!(reviewer.contains("目标软件协作包内"));
+        assert!(reviewer.contains("星梦梦"));
+        assert!(reviewer.contains("阶段不同"));
+
+        assert!(!solution.token_estimate.contains("约 10 万"));
+        assert!(solution.token_estimate.contains("14-18 万"));
+        assert!(solution.token_estimate.contains("9 个角色"));
+    }
+
+    #[test]
     fn normalize_rationale_marks_mobile_delivery_as_assumption_when_still_pending() {
         let mut solution = AgentSolution {
             id: "B".to_string(),
@@ -9174,6 +11607,126 @@ if ($Stage -eq 'confirm') {
             .iter()
             .any(|item| item.relative_path.contains("COORDINATOR-SUBAGENTS.md")));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "requires live MiniMax API access"]
+    fn live_custom_minimax_agent_decision_smoke() {
+        let api_key = std::env::var("COMMONHE_MINIMAX_TEST_KEY")
+            .expect("COMMONHE_MINIMAX_TEST_KEY must be set for live MiniMax tests");
+        let model = std::env::var("COMMONHE_MINIMAX_TEST_MODEL")
+            .unwrap_or_else(|_| "MiniMax-M2.7".to_string());
+        let validation = provider::validate_provider_connection(&ProviderConfig {
+            provider: "custom".to_string(),
+            model: Some(model.clone()),
+            api_key: Some(api_key.clone()),
+            base_url: Some("https://api.minimaxi.com".to_string()),
+        });
+
+        assert!(
+            validation.valid,
+            "{}",
+            validation
+                .user_facing_error
+                .clone()
+                .unwrap_or_else(|| validation.errors.join(","))
+        );
+        assert_eq!(validation.resolved_wire_api, "chat_completions");
+        assert_eq!(
+            validation.resolved_base_url.as_deref(),
+            Some("https://api.minimaxi.com/v1")
+        );
+
+        let mut session = base_session();
+        session.provider = "custom".to_string();
+        session.model = validation.resolved_model.unwrap_or(model);
+        session.api_key = api_key;
+        session.base_url = validation
+            .resolved_base_url
+            .expect("MiniMax validation should resolve /v1 base URL");
+        session.wire_api = validation.resolved_wire_api;
+
+        let decision = request_agent_decision(&session, Some("session_start"))
+            .expect("live MiniMax custom provider should return a parseable agent decision");
+
+        assert_eq!(decision.mode, "question");
+        assert!(!decision.assistant_message.trim().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires live MiniMax API access"]
+    fn live_custom_minimax_ecommerce_reaches_three_solutions() {
+        let api_key = std::env::var("COMMONHE_MINIMAX_TEST_KEY")
+            .expect("COMMONHE_MINIMAX_TEST_KEY must be set for live MiniMax tests");
+        let model = std::env::var("COMMONHE_MINIMAX_TEST_MODEL")
+            .unwrap_or_else(|_| "MiniMax-M2.7".to_string());
+        let workspace = repo_tmp_dir("live-custom-minimax-ecommerce-solutions");
+        let store = AgentStore::new();
+        let repo_root = repo_root();
+        let request = AgentSessionCreateRequest {
+            provider: "custom".to_string(),
+            model,
+            api_key,
+            base_url: "https://api.minimaxi.com/v1".to_string(),
+            wire_api: "chat_completions".to_string(),
+            workspace_path: workspace.to_string_lossy().to_string(),
+            payload_root: repo_root.clone(),
+            orchestrator_path: repo_root
+                .join("tools")
+                .join("common-he-init-orchestrator.ps1"),
+        };
+
+        let initial = store
+            .create_session(request)
+            .expect("live MiniMax ecommerce session should start");
+        assert_eq!(initial.stage, "conversation");
+
+        let after_product = store
+            .send_message(AgentSendRequest {
+                session_id: initial.session_id.clone(),
+                message: "B2B 批发电商网站。".to_string(),
+            })
+            .expect("MiniMax product type prompt should succeed");
+        assert!(after_product.solutions.is_empty());
+
+        let mut after_detail = store
+            .send_message(AgentSendRequest {
+                session_id: initial.session_id.clone(),
+                message: "面向浴室浴霸行业中小批发商、经销商、工程采购商；核心功能包括商品展示、下单支付、用户评价、搜索过滤、优惠券系统、直播带货、后台管理。技术要求是 SaaS 方案、快速上线。请先总结你的理解，不要直接给方案。".to_string(),
+            })
+            .expect("MiniMax ecommerce detail prompt should succeed");
+        assert!(after_detail.solutions.is_empty());
+
+        if !after_detail.readiness.summary_presented {
+            after_detail = store
+                .send_message(AgentSendRequest {
+                    session_id: initial.session_id.clone(),
+                    message: "请先总结你的理解，我确认后你再给三个方案。".to_string(),
+                })
+                .expect("MiniMax summary prompt should succeed");
+            assert!(after_detail.solutions.is_empty());
+        }
+
+        let after_confirm = store
+            .send_message(AgentSendRequest {
+                session_id: initial.session_id.clone(),
+                message: "准确。".to_string(),
+            })
+            .expect("MiniMax confirmation should produce or request three solutions without transport failure");
+
+        assert_eq!(
+            after_confirm.solutions.len(),
+            3,
+            "{}",
+            after_confirm
+                .messages
+                .last()
+                .map(|message| message.content.clone())
+                .unwrap_or_else(|| "missing assistant reply".to_string())
+        );
+        assert!(after_confirm.tool_calls.iter().any(|tool_call| {
+            tool_call.tool_name == "open_solution_selector" && tool_call.status == "requested"
+        }));
     }
 
     #[test]
