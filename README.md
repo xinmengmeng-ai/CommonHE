@@ -6,6 +6,9 @@ CommonHE is the public engineering package for `Xingxing's vibecoding launcher`.
 
 It helps users select a model provider, choose a target workspace, clarify requirements, compare implementation options, confirm a solution, and write the collaboration files Codex needs to continue the project.
 
+<img width="1501" height="1038" alt="vibecoding启动器" src="https://github.com/user-attachments/assets/cb73fb5c-10a0-45ee-b9bb-b15b59bdb8f6" />
+
+
 ## v1.0.1 Release Package
 
 The v1.0.1 launcher package is included in this repository:
