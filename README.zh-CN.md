@@ -6,6 +6,9 @@ CommonHE 是 `星星的vibecoding启动器` 的公开工程包。它不是普通
 
 它会帮助用户完成模型渠道选择、目标工作区选择、需求澄清、方案对比、方案确认，并把后续交给 Codex 接手所需的协作文件落地到目标项目中。
 
+
+<img width="1501" height="1038" alt="vibecoding启动器" src="https://github.com/user-attachments/assets/f3b72c39-5fd7-439f-a025-693eb9dfd37e" />
+
 ## v1.0.1 发布包
 
 v1.0.1 启动器包已放在仓库内：
